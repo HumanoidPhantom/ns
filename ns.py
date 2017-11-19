@@ -19,7 +19,7 @@ id | data | meaning
 4  | token[128] filename[128]                                     | storage to ns - check client-file permissions
 5  | token[128] filename[128] T/F[1]                              | ns to storage - check result
 6  | error_code[1]                                                | for different errors
-7  | size[1] login size[1] pass                            | client to ns - auth
+7  | size[1] login size[1] pass                                   | client to ns - auth
 8  | token[128]                                                   | ns to client - auth
 9  | token[128]                                                   | client to ns - request the tree
 10 | total[1] number[1] datasize[2] data                          | ns to client - send the tree
@@ -53,7 +53,6 @@ Error codes:
 
 conn = None
 cur = None
-ns_socket = None
 MAX_CONNECTIONS_NUMBER = 1000
 PORT = 9090
 
@@ -69,21 +68,21 @@ def init_db():
     cur.execute("CREATE TABLE IF NOT EXISTS entity ("
                     "id INTEGER PRIMARY KEY, "
                     "filepath VARCHAR(65536) NOT NULL, "
-                    "FOREIGN KEY(user_id INTEGER) REFERENCES user(id) NOT NULL, "
+                    "userid INTEGER NOT NULL, "
                     "created INTEGER NOT NULL, "
                     "modified INTEGER NOT NULL, "
-                    "size INTEGER NOT NULL"
+                    "filesize INTEGER NOT NULL"
                 ")")
     conn.commit()
 
     cur.execute("CREATE TABLE IF NOT EXISTS entity_components ("
                     "id INTEGER PRIMARY KEY, "
                     "token VARCHAR(128) NOT NULL, "
-                    "FOREIGN KEY (entity_id INTEGER) REFERENCES entity(id) NOT NULL, "
+                    "entity_id INTEGER NOT NULL, "
                     "ip INTEGER NOT NULL, "
                     "port INTEGER NOT NULL, "
-                    "order INTEGER NOT NULL, "
-                    "to_remove INTEGER DEFAULT 0, "
+                    "file_order INTEGER NOT NULL, "
+                    "to_remove INTEGER DEFAULT 0 "
                 ")")
 
 
@@ -92,82 +91,110 @@ class NameServer(threading.Thread):
         threading.Thread.__init__(self)
         self.host = host
         self.port = port
-        self.connections = []
+        self.connections = [sys.stdin]
+        self.running = True
 
     def run(self):
         self._bind_socket()
         self._run()
 
+    def stop(self):
+        self.running = False
+        self.ns_socket.close()
+
     def _bind_socket(self):
-        global ns_socket
-        ns_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        ns_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.ns_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.ns_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
         try:
-            ns_socket.bind(('localhost', self.port))
+            self.ns_socket.bind(('', self.port))
         except socket.error as msg:
             print 'Cannot bind to the given host and port (%s, %i): %s' % (self.host, self.port, msg)
             sys.exit()
         else:
-            ns_socket.listen(MAX_CONNECTIONS_NUMBER)
-            self.connections.append(ns_socket)
+            print 'NS is up ([q] to exit)'
+            self.ns_socket.listen(MAX_CONNECTIONS_NUMBER)
+            self.connections.append(self.ns_socket)
 
     def _run(self):
-        while True:
+        while self.running:
             try:
-                ready_to_read, ready_to_write, in_error = select.select([sys.stdin, ns_socket], [], [])
+                ready_to_read, ready_to_write, in_error = select.select(self.connections, [], [])
             except socket.error as msg:
                 print msg
                 continue
             else:
                 for sock in ready_to_read:
-                    if sock == ns_socket:
+                    if sock == self.ns_socket:
                         try:
-                            client_socket, client_address = ns_socket.accept()
+                            client_socket, client_address = self.ns_socket.accept()
                         except socket.error as msg:
                             print msg
                             break
                         else:
                             self.connections.append(client_socket)
-                    else:
+                    elif sock != sys.stdin:
                         self._receive(sock)
+                    else:
+                        command = sys.stdin.readline()
+                        sys.stdout.flush()
+                        command = command[-2:-1]
+                        if command == 'q':
+                            print "Bye bye"
+                            self.stop()
+        self.stop()
 
     def _receive(self, sock):
-        msg = sock.recv(1024)
-        print msg.decode()
-        # msg_len = sock.recv(RECV_MSG_LEN)
-        #
-        # if len(msg_len) == RECV_MSG_LEN:
-        #     msg_len = struct.unpack('>I', msg_len)[0]
-        #     tot_data_len = 0
-        #
-        #     sock.recv(2)
-        #     command = sock.recv(8).decode('utf-16')
-        #
-        #     addr, data = receive_message(sock, msg_len - 8, tot_data_len + 8)
-        #
-        #     if addr != '':
-        #         if command == 'auth':
-        #             self.auth_request(addr, data)
-        #         elif command == 'auok':
-        #             self.auok_request(addr, data)
-        #         elif command == 'auer':
-        #             self.auer_request(data)
-        #         elif command == 'newu':
-        #             self.new_user_request(addr, data)
-        #         elif command == 'quit':
-        #             self.quit_request(addr, data)
-        #         elif command == 'mesg':
-        #             self.message_request(addr, data)
-        #         elif command == 'stck':
-        #             self.sticker_request(addr, data)
-        #         elif command == 'erro':
-        #             self.error_request(data)
-        #         else:
-        #             self.wrong_command_request(addr)
+        msg_start = sock.recv(3)
+        try:
+            start, package_id = struct.unpack('>HB', msg_start)
+        except struct.error:
+            print "Wrong header in the package"
+        else:
+            if start != 666:
+                print "This is not devilish package"
+                return
+
+            if package_id == 4:  # storage to ns - check client-file permissions
+                pass
+            elif package_id == 6:  # errors
+                pass
+            elif package_id == 7:  # client to ns - auth
+
+                pass
+            elif package_id == 9:  # client to ns - request the tree
+                pass
+            elif package_id == 13:  # client to ns - get file request
+                pass
+            elif package_id == 15:  # client to ns - update file request
+                pass
+            elif package_id == 17:  # client to ns - file delete request
+                pass
+            elif package_id == 19:  # client to ns - rename file request
+                pass
+            elif package_id == 22:  # storage to ns - file save result
+                pass
+            elif package_id == 24:  # storage to ns - file delete result
+                pass
+            elif package_id == 26:  # storage to ns - file update, draft, result
+                pass
+            elif package_id == 28:  # storage to ns - update file result
+                pass
+            elif package_id == 30:  # storage to ns - send memory information
+                pass
+            else:
+                print "Wrong command received"
+                # TODO SEND RESPONSE ABOUT WRONG COMMAND
+
+    def auth_client(self, sock):
+        """
+        id: 7  | package structure: size[1] login size[1] pass | client to ns - auth
+        """
+        msg = sock.recv(1)
+        login_length = struct.unpack('>B', msg)
 
 
-def parse_packet(packet):
+def parse_package(package):
     pass
 
 
