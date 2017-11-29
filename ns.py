@@ -13,11 +13,12 @@ import math
 import time
 import string
 import re
+import logging
 
 """
 Basic structure: 666+id+data
 
-Existing commands:
+Existing commands (partly outdated):
 
 id | data | meaning
 ---|-----------------------------------------------------------------|--------
@@ -69,11 +70,14 @@ Error codes:
 6: Not Enough Place
 7: File Currently Updating
 8: Already Active Account
-9: No Storage Node Is Available
 """
 
 MAX_CONNECTIONS_NUMBER = 1000
 PORT = 9090
+FILES_DIR = 'files/'
+DB_NAME = "namingserver.db"
+LOGFILE_NAME = "ns.log"
+logging.basicConfig(filename=FILES_DIR + LOGFILE_NAME, level=logging.DEBUG)
 
 # List of errors
 PERMISSION_DENIED = 1
@@ -84,8 +88,6 @@ OLD_TOKEN = 5
 NOT_ENOUGH_PLACE = 6
 FILE_CURRENTLY_UPDATING = 7
 ALREADY_ACTIVE_ACCOUNT = 8
-NO_STORAGE_NODE_IS_AVAILABLE = 9
-
 
 ERROR_TEXT = {
     PERMISSION_DENIED: 'Permission Denied',
@@ -96,7 +98,6 @@ ERROR_TEXT = {
     NOT_ENOUGH_PLACE: 'Not Enough Place',
     FILE_CURRENTLY_UPDATING: 'File Currently Updating',
     ALREADY_ACTIVE_ACCOUNT: 'Already Active Account',
-    NO_STORAGE_NODE_IS_AVAILABLE: ' No Storage Node Is Available'
 }
 
 HANDSHAKE = 1
@@ -115,9 +116,7 @@ CLIENT_DELETE_REQUEST = 17
 CLIENT_SEND_DELETE_RESPONSE = 18
 CLIENT_RENAME_REQUEST = 19
 CLIENT_RENAME_RESPONSE = 20
-STORAGE_SEND_FILE = 21
 CLIENT_FILE_SAVE_RESULT = 22
-STORAGE_SEND_DELETE = 23
 STORAGE_GET_DELETE_RESPONSE = 24
 STORAGE_GET_MEMORY_INFO = 29
 STORAGE_MEMORY_INFO_RESULT = 30
@@ -145,8 +144,6 @@ DATA_SIZE_PACKED = struct.pack('<h', DATA_SIZE)
 
 FILENAME_SIZE = 64
 
-REPLICAS_NUMBER = 3
-
 NODE_TYPE_MAIN = 1
 NODE_TYPE_REPLICA_1 = 2
 NODE_TYPE_REPLICA_2 = 3
@@ -167,7 +164,7 @@ def send(sock, package_id, data):
     try:
         sock.send(header + data)
     except:
-        logging('Error while message sending', DEBUG_MODE)
+        print_logs('Error while message sending', DEBUG_MODE)
         return False
 
     return True
@@ -187,7 +184,7 @@ def read_header(sock, obj):
     try:
         msg_start = sock.recv(3)
     except socket.error as (code, msg):
-        logging((obj, code, msg, sock), DEBUG_MODE)
+        print_logs((obj, code, msg, sock), DEBUG_MODE)
         # if code == 104:
         #     self.connections.remove(sock)
         return False, False
@@ -198,13 +195,13 @@ def read_header(sock, obj):
     try:
         start, package_id = struct.unpack('<hB', msg_start)
     except struct.error as msg:
-        logging((obj, "Wrong header in the package", msg, sock), DEBUG_MODE)
+        print_logs((obj, "Wrong header in the package", msg, sock), DEBUG_MODE)
         return False, False
 
-    logging((obj, start, package_id, sock), DEBUG_MODE)
+    print_logs((obj, start, package_id, sock), DEBUG_MODE)
 
     if start != 666:
-        logging((obj, "This is not devilish package"))
+        print_logs((obj, "This is not devilish package"))
         return False, False
 
     return start, package_id
@@ -232,7 +229,7 @@ def parse_storage_result_response(sock):
 
     if filename is False:
         send_error(sock, WRONG_DATA)
-        logging((sock, ERROR_TEXT[WRONG_DATA], 'filename'), DEBUG_MODE)
+        print_logs((sock, ERROR_TEXT[WRONG_DATA], 'filename'), DEBUG_MODE)
         return False, False
 
     data = sock.recv(1)
@@ -240,15 +237,19 @@ def parse_storage_result_response(sock):
         result, = struct.unpack('<B', data)
     except struct.error as msg:
         send_error(sock, WRONG_DATA)
-        logging((sock, msg, ERROR_TEXT[WRONG_DATA]), DEBUG_MODE)
+        print_logs((sock, msg, ERROR_TEXT[WRONG_DATA]), DEBUG_MODE)
         return False, False
 
     return filename, result
 
 
-def logging(message, debug=True):
+def print_logs(message, debug=True, in_file=True):
+    msg = time.strftime("%Y-%m-%d %H:%M:%S: ", time.gmtime()), message
     if debug:
-        print time.strftime("%Y-%m-%d %H:%M:%S: ", time.gmtime()), message
+        if in_file:
+            logging.debug(msg)
+        else:
+            print msg
 
 
 def create_replicated_components(entity_components):
@@ -386,7 +387,7 @@ class StorageUpdate(threading.Thread):
             self.close_connection(sock)
 
     def close_connection(self, sock, failed_node=True, clear_dict=True):
-        logging(("memory, Client disconnected: ", sock), DEBUG_MODE)
+        print_logs(("memory, Client disconnected: ", sock), DEBUG_MODE)
 
         if sock in self.authorized_nodes:
             self.authorized_nodes.remove(sock)
@@ -426,7 +427,7 @@ class StorageUpdate(threading.Thread):
             try:
                 connection.close()
             except:
-                logging((connection, 'memory, socket already closed'), DEBUG_MODE)
+                print_logs((connection, 'memory, socket already closed'), DEBUG_MODE)
 
         if self.timer:
             self.timer.set()
@@ -439,7 +440,7 @@ class StorageUpdate(threading.Thread):
             try:
                 ready_to_read, ready_to_write, in_error = select.select(self.connections, [], [], 10)
             except socket.error as msg:
-                logging(msg, DEBUG_MODE)
+                print_logs(msg, DEBUG_MODE)
                 continue
 
             for sock in ready_to_read:
@@ -456,7 +457,7 @@ class StorageUpdate(threading.Thread):
                 elif package_id == STORAGE_CREATE_REPLICA_RESPONSE:
                     self.replica_result(sock)
                 else:
-                    logging(('StorageUpdate', 'wrong command'), DEBUG_MODE)
+                    print_logs(('StorageUpdate', 'wrong command'), DEBUG_MODE)
                     self.send_error(sock, WRONG_DATA)
 
             self.clear_connections()
@@ -472,7 +473,7 @@ class StorageUpdate(threading.Thread):
 
         if sock not in self.memory_request_nodes.keys():
             self.send_error(sock, WRONG_DATA)
-            logging((sock, 'memory info operation not permitted for this user/node'), DEBUG_MODE)
+            print_logs((sock, 'memory info operation not permitted for this user/node'), DEBUG_MODE)
             return
 
         total_b = sock.recv(8)
@@ -481,7 +482,7 @@ class StorageUpdate(threading.Thread):
             total, = struct.unpack('<Q', total_b)
             free, = struct.unpack('<Q', free_b)
         except struct.error as msg:
-            logging((sock, msg, ERROR_TEXT[WRONG_DATA]), DEBUG_MODE)
+            print_logs((sock, msg, ERROR_TEXT[WRONG_DATA]), DEBUG_MODE)
             self.send_error(sock, WRONG_DATA)
             return
 
@@ -502,14 +503,14 @@ class StorageUpdate(threading.Thread):
             try:
                 ip = ipaddress.IPv4Address(data)
             except ipaddress.AddressValueError as msg:
-                logging((msg, sock, 'replica result'), DEBUG_MODE)
+                print_logs((msg, sock, 'replica result'), DEBUG_MODE)
                 return
 
             data = sock.recv(2)
             try:
                 port, = struct.unpack('<H', data)
             except struct.error as msg:
-                logging((msg, sock, 'replica result'), DEBUG_MODE)
+                print_logs((msg, sock, 'replica result'), DEBUG_MODE)
                 return
 
             rep_node = Node.find_one({Node.PORT: port, Node.IP: ip})
@@ -535,7 +536,7 @@ class StorageUpdate(threading.Thread):
         filename, result = parse_storage_result_response(sock)
 
         if result == 1:
-            logging('delete file', DEBUG_MODE)
+            print_logs('delete file', DEBUG_MODE)
 
             entity_component = EntityComponent.find_one({
                 EntityComponent.TOKEN: filename,
@@ -602,7 +603,7 @@ class StorageUpdate(threading.Thread):
             out_sock.connect((node[Node.IP], node[Node.PORT]))
         except socket.error:
             Node.update({Node.ALIVE: 0}, {Node.TOKEN: node[Node.TOKEN]})
-            logging(('cannot connect to the node,', node[Node.IP], node[Node.PORT], node[Node.TOKEN]), DEBUG_MODE)
+            print_logs(('cannot connect to the node,', node[Node.IP], node[Node.PORT], node[Node.TOKEN]), DEBUG_MODE)
             return False
 
         self.connections.append(out_sock)
@@ -619,20 +620,20 @@ class StorageUpdate(threading.Thread):
         if not result:
             self.close_connection(out_sock)
         else:
-            logging((out_sock, 'sent', node['ip'], node['port'], node['token'],
+            print_logs((out_sock, 'sent', node['ip'], node['port'], node['token'],
                      'packet id: ' + str(message_type)), DEBUG_MODE)
 
     def clear_connections(self):
         for n_socket in self.memory_request_nodes.keys():
-            logging(('close connection with', n_socket, 'memory info'))
+            print_logs(('close connection with', n_socket, 'memory info'))
             self.close_connection(n_socket, True, False)
 
         for n_socket in self.replica_request_nodes.keys():
-            logging(('close connection with', n_socket, 'replica request'))
+            print_logs(('close connection with', n_socket, 'replica request'))
             self.close_connection(n_socket, True, False)
 
         for n_socket in self.delete_request_nodes.keys():
-            logging(('close connection with', n_socket, 'memory info'))
+            print_logs(('close connection with', n_socket, 'memory info'))
             self.close_connection(n_socket, True, False)
 
         self.memory_request_nodes = {}
@@ -665,7 +666,7 @@ class NamingServer(threading.Thread):
                 try:
                     connection.close()
                 except:
-                    logging((connection, 'socket already closed'), DEBUG_MODE)
+                    print_logs((connection, 'socket already closed'), DEBUG_MODE)
 
         self.storage_update_thread.stop()
 
@@ -675,7 +676,7 @@ class NamingServer(threading.Thread):
             self.close_connection(sock)
 
     def close_connection(self, sock):
-        logging(("Client disconnect: ", sock), DEBUG_MODE)
+        print_logs(("Client disconnect: ", sock), DEBUG_MODE)
         if sock in self.authorized_nodes:
             self.authorized_nodes.remove(sock)
 
@@ -694,10 +695,10 @@ class NamingServer(threading.Thread):
         try:
             self.ns_socket.bind(('', self.port))
         except socket.error as msg:
-            logging(('Cannot bind to the given host and port (%s, %i): %s' % (self.host, self.port, msg)), DEBUG_MODE)
+            print_logs(('Cannot bind to the given host and port (%s, %i): %s' % (self.host, self.port, msg)), DEBUG_MODE)
             sys.exit()
         else:
-            logging('NS is up ([q] to exit)', DEBUG_MODE)
+            print_logs('NS is up ([q] to exit)', DEBUG_MODE)
             self.ns_socket.listen(MAX_CONNECTIONS_NUMBER)
             self.connections.append(self.ns_socket)
 
@@ -707,16 +708,16 @@ class NamingServer(threading.Thread):
             try:
                 ready_to_read, ready_to_write, in_error = select.select(self.connections, [], [])
             except socket.error as msg:
-                logging(msg, DEBUG_MODE)
+                print_logs(msg, DEBUG_MODE)
                 continue
 
             for sock in ready_to_read:
                 if sock == self.ns_socket:
                     try:
                         client_socket, client_address = self.ns_socket.accept()
-                        logging(("New connection: ", client_socket, client_address), DEBUG_MODE)
+                        print_logs(("New connection: ", client_socket, client_address), DEBUG_MODE)
                     except socket.error as msg:
-                        logging(msg, DEBUG_MODE)
+                        print_logs(msg, DEBUG_MODE)
                         break
                     else:
                         self.connections.append(client_socket)
@@ -730,7 +731,7 @@ class NamingServer(threading.Thread):
                         print "Bye bye"
                         self.stop()
                     elif command == 's':
-                        logging(self.connections)
+                        print_logs(self.connections)
 
     def _receive(self, sock):
         start, package_id = read_header(sock, 'NamingServer')
@@ -766,7 +767,7 @@ class NamingServer(threading.Thread):
         elif package_id == CLIENT_NODE_FAILED_REQUEST:
             self.node_failed_request(sock)
         else:
-            logging("Wrong command received", DEBUG_MODE)
+            print_logs("Wrong command received", DEBUG_MODE)
             self.send_error(sock, WRONG_DATA)
 
     def handshake_storage_request(self, sock):
@@ -775,7 +776,7 @@ class NamingServer(threading.Thread):
         """
         # TODO public/private key use
         node, token = self.check_by_token(sock, Node.table_name)
-        logging(('handshake', sock), DEBUG_MODE)
+        print_logs(('handshake', sock), DEBUG_MODE)
         if token is False:
             return
 
@@ -783,7 +784,7 @@ class NamingServer(threading.Thread):
         try:
             ip = ipaddress.IPv4Address(data)
         except ipaddress.AddressValueError as msg:
-            logging((msg, sock), DEBUG_MODE)
+            print_logs((msg, sock), DEBUG_MODE)
             self.send_handshake_response(sock, token, RESPONSE_FAILURE)
             return
 
@@ -792,7 +793,7 @@ class NamingServer(threading.Thread):
             port, = struct.unpack('<H', data)
 
         except struct.error as msg:
-            logging((msg, sock), DEBUG_MODE)
+            print_logs((msg, sock), DEBUG_MODE)
             self.send_handshake_response(sock, token, RESPONSE_FAILURE)
             return
 
@@ -821,13 +822,13 @@ class NamingServer(threading.Thread):
 
         if client_token is False:
             self.send_error(sock, WRONG_DATA)
-            logging((sock, ERROR_TEXT[WRONG_DATA], 'client token'), DEBUG_MODE)
+            print_logs((sock, ERROR_TEXT[WRONG_DATA], 'client token'), DEBUG_MODE)
             return
 
         filename = string_decoding(sock, FILENAME_SIZE, FILENAME_SIZE)
         if filename is False:
             self.send_error(sock, WRONG_DATA)
-            logging((sock, ERROR_TEXT[WRONG_DATA], 'filename'), DEBUG_MODE)
+            print_logs((sock, ERROR_TEXT[WRONG_DATA], 'filename'), DEBUG_MODE)
             return
 
         user = User.find_one({User.TOKEN: client_token})
@@ -846,11 +847,11 @@ class NamingServer(threading.Thread):
             ):
 
                 self.send_client_permission_response(sock, client_token, filename, True)
-                logging((sock, client_token, filename, 'permission granted'), DEBUG_MODE)
+                print_logs((sock, client_token, filename, 'permission granted'), DEBUG_MODE)
                 return
 
         self.send_client_permission_response(sock, client_token, filename, False)
-        logging((sock, client_token, filename, 'client', ERROR_TEXT[PERMISSION_DENIED]), DEBUG_MODE)
+        print_logs((sock, client_token, filename, 'client', ERROR_TEXT[PERMISSION_DENIED]), DEBUG_MODE)
 
     def error_received(self, sock):
         """
@@ -860,12 +861,12 @@ class NamingServer(threading.Thread):
         try:
             error_code, = struct.unpack('<B', error)
         except struct.error as msg:
-            logging((sock, msg), DEBUG_MODE)
+            print_logs((sock, msg), DEBUG_MODE)
         else:
             if error_code in ERROR_TEXT:
-                logging(('The error was received: ' + ERROR_TEXT[error_code]))
+                print_logs(('The error was received: ' + ERROR_TEXT[error_code]))
             else:
-                logging(('Some unfamiliar error was received. Code ' + str(error_code)))
+                print_logs(('Some unfamiliar error was received. Code ' + str(error_code)))
 
     def rename_request(self, sock):
         """
@@ -876,7 +877,7 @@ class NamingServer(threading.Thread):
 
         if user is False:
             send_error(sock, OLD_TOKEN)
-            logging((sock, ERROR_TEXT[OLD_TOKEN]), DEBUG_MODE)
+            print_logs((sock, ERROR_TEXT[OLD_TOKEN]), DEBUG_MODE)
             return
 
         srcfilepath = self.read_data(sock, 2)
@@ -896,7 +897,7 @@ class NamingServer(threading.Thread):
          )
 
         if not entities:
-            logging((sock, user[User.ID], 'file not found'), DEBUG_MODE)
+            print_logs((sock, user[User.ID], 'file not found'), DEBUG_MODE)
             self.rename_response(sock, srcfilepath, dstfilepath, False)
             return
 
@@ -909,7 +910,7 @@ class NamingServer(threading.Thread):
                 {Entity.ID: entity[Entity.ID]}
             )
 
-            logging((sock, entity[Entity.FILEPATH], newfilepath, user[User.ID], entity[Entity.ID], 'renamed'), DEBUG_MODE)
+            print_logs((sock, entity[Entity.FILEPATH], newfilepath, user[User.ID], entity[Entity.ID], 'renamed'), DEBUG_MODE)
         self.rename_response(sock, srcfilepath, dstfilepath, True)
 
     def auth_client(self, sock):
@@ -920,13 +921,13 @@ class NamingServer(threading.Thread):
         try:
             login_length,  = struct.unpack('<B', data)
         except struct.error as msg:
-            logging(msg, DEBUG_MODE)
+            print_logs(msg, DEBUG_MODE)
             return
 
         login = string_decoding(sock, login_length, login_length)
         if login is False:
             send_error(sock, WRONG_DATA)
-            logging('wasnt able to read login', DEBUG_MODE)
+            print_logs('wasnt able to read login', DEBUG_MODE)
 
             return
 
@@ -934,14 +935,14 @@ class NamingServer(threading.Thread):
         try:
             pass_length,  = struct.unpack('<B', data)
         except struct.error as msg:
-            logging(msg, DEBUG_MODE)
+            print_logs(msg, DEBUG_MODE)
             return
 
         passwd = string_decoding(sock, pass_length, pass_length)
 
         if passwd is False:
             send_error(sock, WRONG_DATA)
-            logging('wasnt able to read password', DEBUG_MODE)
+            print_logs('wasnt able to read password', DEBUG_MODE)
             return
 
         user = User.find_one({User.LOGIN: login})
@@ -951,12 +952,12 @@ class NamingServer(threading.Thread):
             free_place = sum([node[Node.FREE_MEMORY] for node in nodes if node[Node.FREE_MEMORY]])
 
             if free_place < USER_SPACE:
-                logging("not enough place on nodes, auth", DEBUG_MODE)
+                print_logs("not enough place on nodes, auth", DEBUG_MODE)
                 send_error(sock, NOT_ENOUGH_PLACE)
                 return
 
             if login_length < 3 or pass_length < 6 or re.search("[^a-zA-Z0-9]+", login + passwd):
-                logging("user entered inappropriate login/password", DEBUG_MODE)
+                print_logs("user entered inappropriate login/password", DEBUG_MODE)
                 send_error(sock, WRONG_DATA)
                 return
 
@@ -964,12 +965,12 @@ class NamingServer(threading.Thread):
             User.add_user(token, login, passwd)
         else:
             if not User.check_passwd(passwd, user):
-                logging(("User", user[User.ID], ERROR_TEXT[WRONG_PASSWORD]), DEBUG_MODE)
+                print_logs(("User", user[User.ID], ERROR_TEXT[WRONG_PASSWORD]), DEBUG_MODE)
                 send_error(sock, WRONG_PASSWORD)
                 return
 
             if User.check_token_time(user):
-                logging(("User", user[User.ID], ERROR_TEXT[ALREADY_ACTIVE_ACCOUNT]), DEBUG_MODE)
+                print_logs(("User", user[User.ID], ERROR_TEXT[ALREADY_ACTIVE_ACCOUNT]), DEBUG_MODE)
                 send_error(sock, ALREADY_ACTIVE_ACCOUNT)
                 return
 
@@ -987,14 +988,14 @@ class NamingServer(threading.Thread):
 
         if token is False:
             self.send_error(sock, WRONG_DATA)
-            logging((sock, ERROR_TEXT[WRONG_DATA]), DEBUG_MODE)
+            print_logs((sock, ERROR_TEXT[WRONG_DATA]), DEBUG_MODE)
             return
 
         user = User.find_one({User.TOKEN: token})
 
         if not user:
             self.send_error(sock, NOT_FOUND)
-            logging((sock, ERROR_TEXT[NOT_FOUND]), DEBUG_MODE)
+            print_logs((sock, ERROR_TEXT[NOT_FOUND]), DEBUG_MODE)
             return
 
         User.update(
@@ -1002,7 +1003,7 @@ class NamingServer(threading.Thread):
             {User.ID: user[User.ID]}
         )
 
-        logging((sock, user['id'], 'user logged out'), DEBUG_MODE)
+        print_logs((sock, user['id'], 'user logged out'), DEBUG_MODE)
 
     def tree_request(self, sock):
         """
@@ -1058,7 +1059,7 @@ class NamingServer(threading.Thread):
         try:
             total, number, datasize = struct.unpack('<BBh', data)
         except struct.error as msg:
-            logging((sock, msg), DEBUG_MODE)
+            print_logs((sock, msg), DEBUG_MODE)
             send_error(sock, WRONG_DATA)
             return
 
@@ -1088,7 +1089,7 @@ class NamingServer(threading.Thread):
         filename, result = parse_storage_result_response(sock)
 
         if result == 1:
-            logging(filename, DEBUG_MODE)
+            print_logs(filename, DEBUG_MODE)
             entity_component = EntityComponent.find_one({
                 EntityComponent.TOKEN: filename,
                 EntityComponent.STATUS: {
@@ -1105,7 +1106,7 @@ class NamingServer(threading.Thread):
                         {EntityComponent.ID: entity_component[EntityComponent.ID]}
                     )
 
-                    logging(('Entity component was saved', entity_component[EntityComponent.ID]), DEBUG_MODE)
+                    print_logs(('Entity component was saved', entity_component[EntityComponent.ID]), DEBUG_MODE)
 
                     updating_components = EntityComponent.find_many({
                         EntityComponent.ENTITY_ID: entity[Entity.ID],
@@ -1133,13 +1134,13 @@ class NamingServer(threading.Thread):
                             entity_data,
                             {Entity.ID: entity[Entity.ID]}
                         )
-                        logging(('Entity was saved', entity[Entity.ID]), DEBUG_MODE)
+                        print_logs(('Entity was saved', entity[Entity.ID]), DEBUG_MODE)
 
                     self.close_connection(sock)
                     return
 
             send_error(sock, WRONG_DATA)
-            logging((sock, filename, ERROR_TEXT[WRONG_DATA]), DEBUG_MODE)
+            print_logs((sock, filename, ERROR_TEXT[WRONG_DATA]), DEBUG_MODE)
 
     def keep_alive_request(self, sock):
         """
@@ -1172,12 +1173,12 @@ class NamingServer(threading.Thread):
         )
 
         if not entities:
-            logging(("User", user[User.ID], "tried to delete file", filepath, ERROR_TEXT[NOT_FOUND]), DEBUG_MODE)
+            print_logs(("User", user[User.ID], "tried to delete file", filepath, ERROR_TEXT[NOT_FOUND]), DEBUG_MODE)
             send_error(sock, NOT_FOUND)
         else:
             for entity in entities:
                 if entity[Entity.STATUS] == STATUS_UPDATING:
-                    logging(
+                    print_logs(
                             ("User", user['id'], "tried to delete file", filepath, ERROR_TEXT[FILE_CURRENTLY_UPDATING]),
                             DEBUG_MODE
                          )
@@ -1187,7 +1188,7 @@ class NamingServer(threading.Thread):
                         {EntityComponent.STATUS: STATUS_DELETED, EntityComponent.ENTITY_ID: 0},
                         {EntityComponent.ENTITY_ID: entity[Entity.ID], EntityComponent.STATUS: {'<>': STATUS_DELETED}}
                     )
-                    logging((filepath, user['id'], sock, 'file was removed (and subfiles if exist)'), DEBUG_MODE)
+                    print_logs((filepath, user['id'], sock, 'file was removed (and subfiles if exist)'), DEBUG_MODE)
 
                     User.update({User.MEMORY: user[User.MEMORY] - entity[Entity.FILESIZE]}, {User.ID: user[User.ID]})
                     Entity.delete({Entity.ID: entity[Entity.ID]})
@@ -1228,9 +1229,9 @@ class NamingServer(threading.Thread):
             [Entity.ID, Entity.STATUS, Entity.FILEPATH, Entity.CREATED, Entity.MODIFIED, Entity.ACCESSED, Entity.FILESIZE]
         )
 
-        logging((userid, filepath), DEBUG_MODE)
+        print_logs((userid, filepath), DEBUG_MODE)
         if entity is None:
-            logging((sock, ERROR_TEXT[NOT_FOUND], "file info request"), DEBUG_MODE)
+            print_logs((sock, ERROR_TEXT[NOT_FOUND], "file info request"), DEBUG_MODE)
             data = '{}'
             self.pack_and_send_data(sock, CLIENT_SEND_FILE_INFO, data)
             return
@@ -1272,7 +1273,7 @@ class NamingServer(threading.Thread):
                 offset += entity_component[EntityComponent.CHUNK_SIZE]
 
         if 0 in count_available_replicas.values():
-            logging("File could not be downloaded. Some nodes are not available", DEBUG_MODE)
+            print_logs("File could not be downloaded. Some nodes are not available", DEBUG_MODE)
             send_error(sock, NOT_FOUND)
             return
 
@@ -1340,7 +1341,7 @@ class NamingServer(threading.Thread):
                 return False, token
             else:
                 if class_name == User.table_name and not User.check_token_time(obj):
-                    logging(('User', obj['id'], 'with too old token'), DEBUG_MODE)
+                    print_logs(('User', obj['id'], 'with too old token'), DEBUG_MODE)
                     send_error(sock, OLD_TOKEN)
                     return False, False
 
@@ -1364,7 +1365,7 @@ class NamingServer(threading.Thread):
             path_size, = struct.unpack('<'+unpack_b, data)
         except struct.error as msg:
             self.send_error(sock, WRONG_DATA)
-            logging((msg, sock), DEBUG_MODE)
+            print_logs((msg, sock), DEBUG_MODE)
             return
 
         data_block = DATA_SIZE if DATA_SIZE < path_size else path_size
@@ -1413,19 +1414,19 @@ class NamingServer(threading.Thread):
         try:
             metadata = json.loads(metadata_json)
         except ValueError as msg:
-            logging((user, msg), DEBUG_MODE)
+            print_logs((user, msg), DEBUG_MODE)
             send_error(sock, WRONG_DATA)
             return
 
-        logging(metadata, DEBUG_MODE)
+        print_logs(metadata, DEBUG_MODE)
 
         if not type(metadata) is dict:
-            logging((user, "the message that was sent is not dictionary"), DEBUG_MODE)
+            print_logs((user, "the message that was sent is not dictionary"), DEBUG_MODE)
             send_error(sock, WRONG_DATA)
             return
 
         if not all(item in metadata.keys()for item in Entity.keys):
-            logging(("Not all parameters for the entity were received", sock), DEBUG_MODE)
+            print_logs(("Not all parameters for the entity were received", sock), DEBUG_MODE)
             send_error(sock, WRONG_DATA)
             return
 
@@ -1439,7 +1440,7 @@ class NamingServer(threading.Thread):
             busy_memory = busy_memory - entity_file[Entity.FILESIZE] + metadata['filesize']
 
         if busy_memory > USER_SPACE:
-            logging(("User dont have enough place available", user[User.ID], sock), DEBUG_MODE)
+            print_logs(("User dont have enough place available", user[User.ID], sock), DEBUG_MODE)
             send_error(sock, NOT_ENOUGH_PLACE)
             return
 
@@ -1449,7 +1450,7 @@ class NamingServer(threading.Thread):
 
         if chunk_sizes is False:
             send_error(sock, NOT_ENOUGH_PLACE)
-            logging(("No place on storages", sock), DEBUG_MODE)
+            print_logs(("No place on storages", sock), DEBUG_MODE)
             return
 
         if not entity_file:
@@ -1462,7 +1463,7 @@ class NamingServer(threading.Thread):
                 user.update({User.MEMORY: busy_memory}, {User.ID: user[User.ID]})
 
         elif entity_file[Entity.STATUS] == STATUS_UPDATING:
-            logging(("User", user['id'], 'cannot update file', filepath + '. File is currently updating.'), DEBUG_MODE)
+            print_logs(("User", user['id'], 'cannot update file', filepath + '. File is currently updating.'), DEBUG_MODE)
             send_error(sock, FILE_CURRENTLY_UPDATING)
             return
         else:
@@ -1493,7 +1494,7 @@ class NamingServer(threading.Thread):
     def update_file(self, sock, entity_id, metadata, chunk_sizes, nodes, continue_load=0):
         metadata['components'] = []
         if metadata['filesize'] == 0:
-            logging(("0 bytes file uploaded, deleting entity components", sock, entity_id), DEBUG_MODE)
+            print_logs(("0 bytes file uploaded, deleting entity components", sock, entity_id), DEBUG_MODE)
         else:
             metadata.pop('filesize', None)
             offset = 0
@@ -1522,7 +1523,7 @@ class NamingServer(threading.Thread):
 
     def file_partitioning_update(self, sock, user):
         if sock not in self.failed_node_info.keys():
-            logging(('no such socket in failed nodes list', sock, self.failed_node_info), DEBUG_MODE)
+            print_logs(('no such socket in failed nodes list', sock, self.failed_node_info), DEBUG_MODE)
 
         info = self.failed_node_info[sock]
 
@@ -1533,11 +1534,11 @@ class NamingServer(threading.Thread):
         try:
             file_data = json.loads(data)
         except ValueError as msg:
-            logging((sock, msg, 'file partitioning update'), DEBUG_MODE)
+            print_logs((sock, msg, 'file partitioning update'), DEBUG_MODE)
             return
 
         if not ('filepath' or 'data' or 'node') in file_data:
-            logging((sock, 'wrong data was sent (failed node request)'), DEBUG_MODE)
+            print_logs((sock, 'wrong data was sent (failed node request)'), DEBUG_MODE)
             return
 
         entity = Entity.find_one(
@@ -1546,7 +1547,7 @@ class NamingServer(threading.Thread):
         )
 
         if not entity:
-            logging((sock, 'entity not found', file_data['filepath']), DEBUG_MODE)
+            print_logs((sock, 'entity not found', file_data['filepath']), DEBUG_MODE)
             return
 
         # TODO how nodes are sent - field name
@@ -1603,7 +1604,7 @@ class NamingServer(threading.Thread):
                 )
 
                 send_error(sock, NOT_ENOUGH_PLACE)
-                logging('node failed, no place available', DEBUG_MODE)
+                print_logs('node failed, no place available', DEBUG_MODE)
                 return
 
         self.update_file(sock, entity[Entity.ID], {'filesize': entity[Entity.FILESIZE]}, chunk_sizes, nodes, continue_load)
@@ -1858,7 +1859,7 @@ class Node:
     @staticmethod
     def check_node(sock, authorized_nodes):
         if sock not in authorized_nodes:
-            logging((sock, 'node', ERROR_TEXT[PERMISSION_DENIED]), DEBUG_MODE)
+            print_logs((sock, 'node', ERROR_TEXT[PERMISSION_DENIED]), DEBUG_MODE)
             return False
 
         return True
@@ -1885,7 +1886,7 @@ class DBRequests:
 
     @staticmethod
     def connect_to_db(command, args=(), command_type=DB_QUERY_TYPE_OTHER):
-        conn = sqlite3.connect("files/namingserver.db")
+        conn = sqlite3.connect(FILES_DIR + DB_NAME)
         conn.row_factory = DBRequests.dict_factory
         cur = conn.cursor()
 
