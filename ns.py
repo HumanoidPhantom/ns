@@ -79,6 +79,9 @@ DB_NAME = "namingserver.db"
 LOGFILE_NAME = "ns.log"
 logging.basicConfig(filename=FILES_DIR + LOGFILE_NAME, level=logging.DEBUG)
 
+DEBUG_MODE = True
+LOG_IN_FILE = False
+
 # List of errors
 PERMISSION_DENIED = 1
 WRONG_PASSWORD = 2
@@ -154,8 +157,6 @@ DB_QUERY_TYPE_INSERT = 1
 DB_QUERY_TYPE_SELECT_ONE = 2
 DB_QUERY_TYPE_SELECT_ALL = 3
 DB_QUERY_TYPE_OTHER = 4
-
-DEBUG_MODE = True
 
 
 def send(sock, package_id, data):
@@ -243,11 +244,11 @@ def parse_storage_result_response(sock):
     return filename, result
 
 
-def print_logs(message, debug=True, in_file=True):
-    msg = time.strftime("%Y-%m-%d %H:%M:%S: ", time.gmtime()), message
+def print_logs(message, debug=True, in_file=LOG_IN_FILE):
+    msg = time.strftime(" %Y-%m-%d %H:%M:%S: ", time.gmtime()), message
     if debug:
         if in_file:
-            logging.debug(msg)
+            logging.info(msg)
         else:
             print msg
 
