@@ -1885,7 +1885,7 @@ class DBRequests:
 
     @staticmethod
     def connect_to_db(command, args=(), command_type=DB_QUERY_TYPE_OTHER):
-        conn = sqlite3.connect("db/namingserver.db")
+        conn = sqlite3.connect("files/namingserver.db")
         conn.row_factory = DBRequests.dict_factory
         cur = conn.cursor()
 
