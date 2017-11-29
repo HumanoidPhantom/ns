@@ -1,2 +1,2 @@
 # ns
-Name server
+Naming Server

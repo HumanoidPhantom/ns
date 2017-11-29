@@ -167,7 +167,7 @@ def send(sock, package_id, data):
     try:
         sock.send(header + data)
     except:
-        print 'Error while message sending'
+        logging('Error while message sending', DEBUG_MODE)
         return False
 
     return True
@@ -248,7 +248,7 @@ def parse_storage_result_response(sock):
 
 def logging(message, debug=True):
     if debug:
-        print time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()), message
+        print time.strftime("%Y-%m-%d %H:%M:%S: ", time.gmtime()), message
 
 
 def create_replicated_components(entity_components):
@@ -256,9 +256,9 @@ def create_replicated_components(entity_components):
     indexed_components = {}
     for item in entity_components:
         if item[EntityComponent.ENTITY_ID] in indexed_components:
-            item[EntityComponent.ENTITY_ID].append(item)
+            indexed_components[EntityComponent.ENTITY_ID].append(item)
         else:
-            item[EntityComponent.ENTITY_ID] = [item]
+            indexed_components[EntityComponent.ENTITY_ID] = [item]
 
     nodes_r_1 = Node.find_many({Node.NODE_TYPE: NODE_TYPE_REPLICA_1})
     free_space_1_list = [item[Node.FREE_MEMORY] for item in nodes_r_1]
@@ -274,7 +274,7 @@ def create_replicated_components(entity_components):
     result_list_2 = {}
     r_2_append_size_list = {}
 
-    for ent_file in indexed_components:
+    for ent_file in indexed_components.values():
         chunk_sizes = sorted([comp[EntityComponent.CHUNK_SIZE] for comp in ent_file])
         required_size = sum(chunk_sizes)
 
@@ -322,10 +322,10 @@ def count_for_replica(ent_file, chunk_sizes, nodes_r, r_append_size_list, result
         tmp_node_id = 0
         tmp_size = 0
         for node in nodes_r:
-            if tmp_node_id not in tmp_r_append_size_list.keys():
-                tmp_r_append_size_list[tmp_node_id] = 0
+            if node[Node.ID] not in tmp_r_append_size_list.keys():
+                tmp_r_append_size_list[node[Node.ID]] = 0
 
-            node_free = node[Node.FREE_MEMORY] - tmp_r_append_size_list[tmp_node_id]
+            node_free = node[Node.FREE_MEMORY] - tmp_r_append_size_list[node[Node.ID]]
 
             if node_free > size and (node_free < tmp_size or tmp_size is 0):
                 tmp_node_id = node[Node.ID]
@@ -759,8 +759,6 @@ class NamingServer(threading.Thread):
             self.rename_request(sock)
         elif package_id == CLIENT_FILE_SAVE_RESULT:  # storage to ns - file save result, draft
             self.file_save_result_request(sock)
-        elif package_id == 28:  # storage to ns - update file result
-            pass
         elif package_id == CLIENT_KEEP_ALIVE:  # client to ns - keep alive
             self.keep_alive_request(sock)
         elif package_id == CLIENT_LOGOUT:
@@ -768,7 +766,7 @@ class NamingServer(threading.Thread):
         elif package_id == CLIENT_NODE_FAILED_REQUEST:
             self.node_failed_request(sock)
         else:
-            print "Wrong command received"
+            logging("Wrong command received", DEBUG_MODE)
             self.send_error(sock, WRONG_DATA)
 
     def handshake_storage_request(self, sock):
@@ -777,7 +775,7 @@ class NamingServer(threading.Thread):
         """
         # TODO public/private key use
         node, token = self.check_by_token(sock, Node.table_name)
-        print 'handshake', sock
+        logging(('handshake', sock), DEBUG_MODE)
         if token is False:
             return
 
@@ -785,7 +783,7 @@ class NamingServer(threading.Thread):
         try:
             ip = ipaddress.IPv4Address(data)
         except ipaddress.AddressValueError as msg:
-            print msg, sock
+            logging((msg, sock), DEBUG_MODE)
             self.send_handshake_response(sock, token, RESPONSE_FAILURE)
             return
 
@@ -794,18 +792,18 @@ class NamingServer(threading.Thread):
             port, = struct.unpack('<H', data)
 
         except struct.error as msg:
-            print msg, sock
+            logging((msg, sock), DEBUG_MODE)
             self.send_handshake_response(sock, token, RESPONSE_FAILURE)
             return
 
         if not node:
             nodes = Node.find_many()
-            Node.add(token, str(ip), port, len(nodes) % 3)
+            Node.add(token, str(ip), port, len(nodes) % 3 + 1)
         else:
             params = {
-                'ip': str(ip),
-                'port': port,
-                'alive': 1
+                Node.IP: str(ip),
+                Node.PORT: port,
+                Node.ALIVE: 1
             }
             Node.update(params, {Node.TOKEN: token})
 
@@ -877,8 +875,8 @@ class NamingServer(threading.Thread):
         user, token = self.check_by_token(sock, User.table_name)
 
         if user is False:
-            self.send_error(sock, OLD_TOKEN)
-            print sock, ERROR_TEXT[OLD_TOKEN]
+            send_error(sock, OLD_TOKEN)
+            logging((sock, ERROR_TEXT[OLD_TOKEN]), DEBUG_MODE)
             return
 
         srcfilepath = self.read_data(sock, 2)
@@ -1212,7 +1210,7 @@ class NamingServer(threading.Thread):
             [Entity.FILEPATH, Entity.CREATED, Entity.MODIFIED, Entity.ACCESSED, Entity.FILESIZE]
         )
 
-        tree.insert({
+        tree.insert(0, {
             'total': USER_SPACE,
             'free': USER_SPACE - user[User.MEMORY]
         })
@@ -1247,9 +1245,16 @@ class NamingServer(threading.Thread):
 
         entity_list = []
         offset = 0
+        count_available_replicas = {}
 
         for entity_component in entity_components:
-            tmp_node = Node.find_one({Node.ID: entity_component[EntityComponent.NODE_ID]})
+            if entity_component[EntityComponent.ID] not in count_available_replicas.keys():
+                entity_component[EntityComponent.ID] = 0
+
+            tmp_node = Node.find_one({
+                Node.ID: entity_component[EntityComponent.NODE_ID],
+                Node.ALIVE: 1
+            })
 
             if tmp_node:
                 entity_list.append({
@@ -1263,8 +1268,13 @@ class NamingServer(threading.Thread):
                     'offset': offset
                 })
 
-                if tmp_node[Node.NODE_TYPE] == NODE_TYPE_MAIN:
-                    offset += entity_component[EntityComponent.CHUNK_SIZE]
+            if count_available_replicas[entity_component[EntityComponent.ID]] == 1:
+                offset += entity_component[EntityComponent.CHUNK_SIZE]
+
+        if 0 in count_available_replicas.values():
+            logging("File could not be downloaded. Some nodes are not available", DEBUG_MODE)
+            send_error(sock, NOT_FOUND)
+            return
 
         entity.pop(Entity.ID, None)
         entity.pop(Entity.STATUS, None)
@@ -1379,24 +1389,20 @@ class NamingServer(threading.Thread):
                 self.close_connection(sock)
 
     def separate_on_chunks(self, free_places, filesize):
-
-
-        # TODO improve algorithm so that free space for each node would become more equal
         # !!!!! WARNING !!!!! Not clever file splitter
 
-        totally_free = sum(free_places)
+        totally_free = sum(free_places.values())
         if totally_free < filesize:
             return False
 
-        rel_places = [int(math.floor(filesize * item / float(totally_free))) for item in free_places]
+        rel_places = {item: int(math.floor(filesize * free_places[item] / float(totally_free))) for item in free_places}
 
-        diff = filesize - sum(rel_places)
-        i = 0
-        while diff > 0 and i < len(free_places):
-            if rel_places[i] < free_places[i] and not rel_places[i] is 0:
-                rel_places[i] += 1
-                diff -= 1
-            i += 1
+        diff = filesize - sum(rel_places.values())
+
+        while diff > 0:
+            for item in free_places.keys():
+                if rel_places[item] < free_places[item] and not rel_places[item] is 0:
+                    rel_places[item] += 1
 
         return rel_places
 
@@ -1438,7 +1444,7 @@ class NamingServer(threading.Thread):
             return
 
         nodes = Node.find_many({Node.ALIVE: 1, Node.NODE_TYPE: NODE_TYPE_MAIN})
-        free_places = [node[Node.FREE_MEMORY] for node in nodes if node[Node.FREE_MEMORY]]
+        free_places = {node[Node.ID]: node[Node.FREE_MEMORY] for node in nodes if node[Node.FREE_MEMORY]}
         chunk_sizes = self.separate_on_chunks(free_places, metadata['filesize'])
 
         if chunk_sizes is False:
@@ -1484,40 +1490,39 @@ class NamingServer(threading.Thread):
 
         self.update_file(sock, entity_id, metadata, chunk_sizes, nodes)
 
-    def update_file(self, sock, entity_id, metadata, chunk_sizes, nodes):
+    def update_file(self, sock, entity_id, metadata, chunk_sizes, nodes, continue_load=0):
         metadata['components'] = []
         if metadata['filesize'] == 0:
             logging(("0 bytes file uploaded, deleting entity components", sock, entity_id), DEBUG_MODE)
         else:
             metadata.pop('filesize', None)
             offset = 0
-            for i in range(len(chunk_sizes)):
+            i = 1
+            for node_id in chunk_sizes.keys():
                 filename = EntityComponent.add(
-                    entity_id, nodes[i][Node.ID], i + 1,
-                    NODE_TYPE_MAIN, STATUS_UPDATING, chunk_sizes[i]
+                    entity_id, node_id, i,
+                    NODE_TYPE_MAIN, STATUS_UPDATING, chunk_sizes[node_id]
                 )
 
                 metadata['components'].append({
                     'filename': filename,
-                    'filesize': chunk_sizes[i],
-                    'ip': nodes[i][Node.IP],
-                    'port': nodes[i][Node.PORT],
-                    'file_order': i + 1,
+                    'filesize': chunk_sizes[node_id],
+                    'ip': nodes[node_id][Node.IP],
+                    'port': nodes[node_id][Node.PORT],
+                    'file_order': i,
                     'replica': NODE_TYPE_MAIN,
-                    'continue': 0,
+                    'continue': continue_load,
                     'offset': offset
                 })
-
-                offset += chunk_sizes[i]
+                offset += chunk_sizes[node_id]
+                i += 1
 
         json_tree = json.dumps(metadata)
         self.pack_and_send_data(sock, CLIENT_SEND_UPLOAD_RESULT, json_tree)
 
     def file_partitioning_update(self, sock, user):
-        #         flag - continue, offset
-
         if sock not in self.failed_node_info.keys():
-            print 'no such socket in failed nodes list', sock, self.failed_node_info
+            logging(('no such socket in failed nodes list', sock, self.failed_node_info), DEBUG_MODE)
 
         info = self.failed_node_info[sock]
 
@@ -1528,79 +1533,80 @@ class NamingServer(threading.Thread):
         try:
             file_data = json.loads(data)
         except ValueError as msg:
-            print sock, msg, 'file partitioning update'
+            logging((sock, msg, 'file partitioning update'), DEBUG_MODE)
             return
 
         if not ('filepath' or 'data' or 'node') in file_data:
-            print sock, 'wrong data was sent (failed node request)'
+            logging((sock, 'wrong data was sent (failed node request)'), DEBUG_MODE)
             return
 
         entity = Entity.find_one(
-            {Entity.USER_ID: user['id'], Entity.FILEPATH: file_data['filepath']},
+            {Entity.USER_ID: user[User.ID], Entity.FILEPATH: file_data['filepath']},
             [Entity.ID, Entity.STATUS, Entity.FILEPATH, Entity.CREATED, Entity.MODIFIED, Entity.ACCESSED, Entity.FILESIZE]
         )
 
         if not entity:
-            print sock, 'entity not found', file_data['filepath']
+            logging((sock, 'entity not found', file_data['filepath']), DEBUG_MODE)
             return
 
-        Node.update({Node.ALIVE: 0}, {Node.IP: file_data['node']['ip'], Node.PORT: file_data['node']['port']})
+        # TODO how nodes are sent - field name
+        Node.update({Node.ALIVE: 0}, {
+            Node.IP: file_data['node']['ip'], Node.PORT: file_data['node']['port'], Node.NODE_TYPE: NODE_TYPE_MAIN
+        })
 
         nodes = Node.find_many({Node.ALIVE: 1, Node.NODE_TYPE: NODE_TYPE_MAIN})
 
         uploaded_components = EntityComponent.find_many({
-            EntityComponent.ENTITY_ID: entity['id'],
-            EntityComponent.STATUS: {
-                '<>': STATUS_DELETED,
-                '=': STATUS_SAVED
-            }
+            EntityComponent.ENTITY_ID: entity[Entity.ID],
+            EntityComponent.STATUS: STATUS_SAVED
         })
 
-        uploaded_ids = [item['node_id'] for item in uploaded_components]
-        free_memory = [item['free_memory'] for item in nodes if item['id'] not in uploaded_ids]
+        uploaded_ids = [item[EntityComponent.NODE_ID] for item in uploaded_components]
+        free_memory = {node[Node.ID]: node[Node.FREE_MEMORY] for node in nodes
+                       if nodes[EntityComponent.ID] not in uploaded_ids}
 
         not_loaded_components = EntityComponent.find_many({
-            EntityComponent.ENTITY_ID: entity['id'],
-            EntityComponent.STATUS: {
-                '<>': STATUS_DELETED,
-                '=': STATUS_UPDATING
-            }
+            EntityComponent.ENTITY_ID: entity[Entity.ID],
+            EntityComponent.STATUS: STATUS_UPDATING
         })
 
-        not_loaded_size = 0
-
-        for comp in not_loaded_components:
-            not_loaded_components += comp['chunk_size']
-
+        not_loaded_size = sum([item[EntityComponent.CHUNK_SIZE] for item in not_loaded_components])
         chunk_sizes = self.separate_on_chunks(free_memory, not_loaded_size)
 
+        continue_load = 1
         if not chunk_sizes:
             for comp in uploaded_components:
-                EntityComponent.update({EntityComponent.STATUS: STATUS_DELETED}, {EntityComponent.ID: comp['id']})
+                EntityComponent.update({EntityComponent.STATUS: STATUS_DELETED}, {EntityComponent.ID: comp[EntityComponent.ID]})
+                not_loaded_size += comp[EntityComponent.CHUNK_SIZE]
 
-            for comp in uploaded_components:
-                if comp['node_id']:
-                    not_loaded_size += comp['chunk_size']
-
-            free_memory = [item['free_memory'] for item in nodes]
+            free_memory = {node[Node.ID]: node[Node.FREE_MEMORY] for node in nodes}
             chunk_sizes = self.separate_on_chunks(free_memory, not_loaded_size)
-
+            continue_load = 0
             if not chunk_sizes:
-                self.send_error(sock, NOT_ENOUGH_PLACE)
-                print 'node failed, no place available'
+                # TODO possible collision, if file pointed as deleted, but actually - not yet
+                user.update({User.MEMORY: user[User.MEMORY] + entity[Entity.FILESIZE]}, {User.ID: user[User.ID]})
+
+                EntityComponent.update(
+                    {EntityComponent.STATUS: STATUS_SAVED},
+                    {EntityComponent.STATUS: STATUS_OLD, EntityComponent.ENTITY_ID: entity[Entity.ID]}
+                )
+
+                entity_data = {
+                    Entity.MODIFIED_NEW: None,
+                    Entity.STATUS: STATUS_SAVED,
+                    Entity.FILESIZE_NEW: None
+                }
+
+                Entity.update(
+                    entity_data,
+                    {Entity.ID: entity[Entity.ID]}
+                )
+
+                send_error(sock, NOT_ENOUGH_PLACE)
+                logging('node failed, no place available', DEBUG_MODE)
                 return
 
-        # if entity['status'] == STATUS_SAVED or entity['filesize'] == 0 or len(file_data['data']) == 0:
-        #     Entity.update_entity(entity['id'], {'status': STATUS_UPDATING})
-        #     EntityComponent.update_components_status(STATUS_OLD, entity['id'])
-        #     self.update_file(sock, entity['id'], {'filesize': 0})
-
-
-
-
-
-
-
+        self.update_file(sock, entity[Entity.ID], {'filesize': entity[Entity.FILESIZE]}, chunk_sizes, nodes, continue_load)
 
 
 class User:
@@ -1852,7 +1858,7 @@ class Node:
     @staticmethod
     def check_node(sock, authorized_nodes):
         if sock not in authorized_nodes:
-            print sock, 'node', ERROR_TEXT[PERMISSION_DENIED]
+            logging((sock, 'node', ERROR_TEXT[PERMISSION_DENIED]), DEBUG_MODE)
             return False
 
         return True
