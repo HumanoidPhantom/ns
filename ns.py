@@ -120,6 +120,7 @@ CLIENT_SEND_DELETE_RESPONSE = 18
 CLIENT_RENAME_REQUEST = 19
 CLIENT_RENAME_RESPONSE = 20
 CLIENT_FILE_SAVE_RESULT = 22
+STORAGE_SEND_DELETE_REQUEST = 23
 STORAGE_GET_DELETE_RESPONSE = 24
 STORAGE_GET_MEMORY_INFO = 29
 STORAGE_MEMORY_INFO_RESULT = 30
@@ -141,6 +142,7 @@ STATUS_SAVED = 2
 STATUS_OLD = 3
 STATUS_DELETED = 4
 STATUS_REPLICATING = 5
+STATUS_REPLICATING_WAITING = 6
 
 DATA_SIZE = 4096
 DATA_SIZE_PACKED = struct.pack('<h', DATA_SIZE)
@@ -157,6 +159,23 @@ DB_QUERY_TYPE_INSERT = 1
 DB_QUERY_TYPE_SELECT_ONE = 2
 DB_QUERY_TYPE_SELECT_ALL = 3
 DB_QUERY_TYPE_OTHER = 4
+
+storage_update_thread = None
+
+def error_received(sock):
+    """
+    6  | error_code[1]  | for different errors
+    """
+    error = sock.recv(1)
+    try:
+        error_code, = struct.unpack('<B', error)
+    except struct.error as msg:
+        print_logs((sock, msg))
+    else:
+        if error_code in ERROR_TEXT:
+            print_logs(('The error was received: ' + ERROR_TEXT[error_code]))
+        else:
+            print_logs(('Some unfamiliar error was received. Code ' + str(error_code)))
 
 
 def send(sock, package_id, data):
@@ -192,19 +211,16 @@ def read_header(sock, obj):
 
     if len(msg_start) == 0:
         return False, False
-
     try:
         start, package_id = struct.unpack('<hB', msg_start)
     except struct.error as msg:
         print_logs((obj, "Wrong header in the package", msg, sock), DEBUG_MODE)
         return False, False
-
     print_logs((obj, start, package_id, sock), DEBUG_MODE)
 
     if start != 666:
         print_logs((obj, "This is not devilish package"))
         return False, False
-
     return start, package_id
 
 
@@ -254,20 +270,19 @@ def print_logs(message, debug=True, in_file=LOG_IN_FILE):
 
 
 def create_replicated_components(entity_components):
-
     indexed_components = {}
     for item in entity_components:
         if item[EntityComponent.ENTITY_ID] in indexed_components:
-            indexed_components[EntityComponent.ENTITY_ID].append(item)
+            indexed_components[item[EntityComponent.ENTITY_ID]].append(item)
         else:
-            indexed_components[EntityComponent.ENTITY_ID] = [item]
+            indexed_components[item[EntityComponent.ENTITY_ID]] = [item]
 
     nodes_r_1 = Node.find_many({Node.NODE_TYPE: NODE_TYPE_REPLICA_1})
-    free_space_1_list = [item[Node.FREE_MEMORY] for item in nodes_r_1]
+    free_space_1_list = [item[Node.FREE_MEMORY] if item[Node.FREE_MEMORY] else 0 for item in nodes_r_1]
     free_space_1 = sum(free_space_1_list)
 
     nodes_r_2 = Node.find_many({Node.NODE_TYPE: NODE_TYPE_REPLICA_2})
-    free_space_2_list = [item[Node.FREE_MEMORY] for item in nodes_r_2]
+    free_space_2_list = [item[Node.FREE_MEMORY]  if item[Node.FREE_MEMORY] else 0 for item in nodes_r_2]
     free_space_2 = sum(free_space_2_list)
 
     result_list_1 = {}
@@ -282,7 +297,7 @@ def create_replicated_components(entity_components):
 
         if required_size < free_space_1:
             success, tmp_size_list, tmp_result_list = \
-                count_for_replica(ent_file, chunk_sizes, nodes_r_1, r_1_append_size_list, result_list_1)
+                count_for_replica(ent_file, chunk_sizes, nodes_r_1, r_1_append_size_list, result_list_1, NODE_TYPE_REPLICA_1)
 
             if success:
                 free_space_1 -= required_size
@@ -298,8 +313,8 @@ def create_replicated_components(entity_components):
 
         if required_size < free_space_2:
             success, tmp_size_list, tmp_result_list = \
-                count_for_replica(ent_file, chunk_sizes, nodes_r_2, r_2_append_size_list, result_list_2)
-
+                count_for_replica(ent_file, chunk_sizes, nodes_r_2, r_2_append_size_list, result_list_2, NODE_TYPE_REPLICA_2)
+            print_logs((tmp_size_list, tmp_result_list), False, True)
             if success:
                 free_space_2 -= required_size
                 for sz in tmp_size_list.keys():
@@ -312,14 +327,16 @@ def create_replicated_components(entity_components):
                         result_list_1[item_key] = []
                     result_list_1[item_key] += tmp_result_list[item_key]
 
+    print_logs(("result:", result_list_1, result_list_2), False, True)
     return result_list_1, result_list_2
 
 
-def count_for_replica(ent_file, chunk_sizes, nodes_r, r_append_size_list, result_list_r):
+def count_for_replica(ent_file, chunk_sizes, nodes_r, r_append_size_list, result_list_r, repl_numb):
     tmp_list = []
     success = True
     tmp_r_append_size_list = r_append_size_list.copy()
     tmp_result_list_r = result_list_r.copy()
+
     for size in chunk_sizes:
         tmp_node_id = 0
         tmp_size = 0
@@ -338,31 +355,40 @@ def count_for_replica(ent_file, chunk_sizes, nodes_r, r_append_size_list, result
             break
 
         tmp_list.append((size, tmp_node_id))
-        tmp_r_append_size_list[tmp_node_id] += tmp_size
+        tmp_r_append_size_list[tmp_node_id] += size
 
     if success:
         for comp in ent_file:
             rm_item = 0
+            ind = 0
             for size_item in tmp_list:
                 if comp[EntityComponent.CHUNK_SIZE] == size_item[0]:
-                    EntityComponent.add(
+                    ent_id = EntityComponent.add(
                         comp[EntityComponent.ENTITY_ID], size_item[1], comp[EntityComponent.FILE_ORDER],
-                        NODE_TYPE_REPLICA_1, STATUS_UPDATING, size_item[0]
+                        repl_numb, STATUS_REPLICATING_WAITING, size_item[0], comp[EntityComponent.TOKEN]
                     )
 
-                    rm_item = size_item
+                    EntityComponent.update_field({EntityComponent.STATUS: STATUS_SAVED}, {EntityComponent.ID: comp[EntityComponent.ID]})
+
+                    rm_item = size_item[:]
                     if size_item[1] not in tmp_result_list_r.keys():
                         tmp_result_list_r[size_item[1]] = []
 
-                        tmp_result_list_r[size_item[1]].append(
-                            comp[EntityComponent.TOKEN].encode() +
-                            ipaddress.IPv4Address(nodes_r[Node.ID][Node.IP].decode()).packed +
-                            struct.pack('<H', nodes_r[Node.ID][Node.PORT])
+                    tmp_node = None
+                    for node_i in nodes_r:
+                        if node_i[Node.ID] == size_item[1]:
+                            tmp_node = node_i
+
+                    if tmp_node:
+                        tmp_result_list_r[size_item[1]].append((
+                            ipaddress.IPv4Address(tmp_node[Node.IP].decode()).packed +
+                            struct.pack('<H', tmp_node[Node.PORT]) +
+                            comp[EntityComponent.TOKEN].encode(), ent_id)
                         )
 
                     break
+            ind += 1
             tmp_list.remove(rm_item)
-
     return success, tmp_r_append_size_list, tmp_result_list_r
 
 
@@ -376,9 +402,12 @@ class StorageUpdate(threading.Thread):
         self.delete_request_nodes = {}
         self.replica_request_nodes = {}
         self.timer = None
+        self.clear_timer = time.time()
+        self.replicating_components = []
+        self.success_repl_nodes = []
+        self.repl_counter = {}
 
     def run(self):
-        self.connect_to_nodes()
         self._run()
 
     def send_error(self, sock, error_code):
@@ -387,40 +416,37 @@ class StorageUpdate(threading.Thread):
         if not result:
             self.close_connection(sock)
 
-    def close_connection(self, sock, failed_node=True, clear_dict=True):
+    def close_connection(self, sock, failed_node=True, clear_dict=True, clear_main=False, clear_replica=True):
         print_logs(("memory, Client disconnected: ", sock), DEBUG_MODE)
-
         if sock in self.authorized_nodes:
             self.authorized_nodes.remove(sock)
 
         if sock in self.memory_request_nodes.keys():
             if failed_node:
-                Node.update({Node.ALIVE: 0}, {Node.TOKEN: self.memory_request_nodes[sock]})
+                Node.update_field({Node.ALIVE: 0}, {Node.TOKEN: self.memory_request_nodes[sock]})
 
             if clear_dict:
                 self.memory_request_nodes.pop(sock, None)
+        if clear_replica:
+            if sock in self.replica_request_nodes.keys():
+                if failed_node:
+                    Node.update_field({Node.ALIVE: 0}, {Node.TOKEN: self.replica_request_nodes[sock]})
 
-        if sock in self.replica_request_nodes.keys():
-            if failed_node:
-                Node.update({Node.ALIVE: 0}, {Node.TOKEN: self.replica_request_nodes[sock]})
-
-            if clear_dict:
-                self.replica_request_nodes.pop(sock, None)
-
+                if clear_dict:
+                    self.replica_request_nodes.pop(sock, None)
         if sock in self.delete_request_nodes.keys():
             if failed_node:
-                Node.update({Node.ALIVE: 0}, {Node.TOKEN: self.delete_request_nodes[sock]})
+                Node.update_field({Node.ALIVE: 0}, {Node.TOKEN: self.delete_request_nodes[sock]})
 
             if clear_dict:
                 self.delete_request_nodes.pop(sock, None)
-
-        if sock in self.connections:
-            self.connections.remove(sock)
-
-        try:
-            sock.close()
-        except:
-            pass
+        if clear_main:
+            if sock in self.connections:
+                self.connections.remove(sock)
+            try:
+                sock.close()
+            except:
+                pass
 
     def stop(self):
         self.running.set()
@@ -432,19 +458,14 @@ class StorageUpdate(threading.Thread):
 
         if self.timer:
             self.timer.set()
+        sys.exit()
 
     def _run(self):
         while not self.running.is_set():
             self.timer = threading.Event()
             self.connect_to_nodes()
 
-            try:
-                ready_to_read, ready_to_write, in_error = select.select(self.connections, [], [], 10)
-            except socket.error as msg:
-                print_logs(msg, DEBUG_MODE)
-                continue
-
-            for sock in ready_to_read:
+            for sock in self.connections:
                 start, package_id = read_header(sock, 'StorageUpdate')
 
                 if not (start and package_id):
@@ -457,9 +478,11 @@ class StorageUpdate(threading.Thread):
                     self.delete_result(sock)
                 elif package_id == STORAGE_CREATE_REPLICA_RESPONSE:
                     self.replica_result(sock)
+                elif package_id == ERROR_MSG:
+                    error_received(sock)
                 else:
                     print_logs(('StorageUpdate', 'wrong command'), DEBUG_MODE)
-                    self.send_error(sock, WRONG_DATA)
+                    send_error(sock, WRONG_DATA)
 
             self.clear_connections()
 
@@ -471,12 +494,10 @@ class StorageUpdate(threading.Thread):
         30 | total[8] free[8]  | storage to ns - send memory information
         """
         Node.check_node(sock, self.authorized_nodes)
-
         if sock not in self.memory_request_nodes.keys():
             self.send_error(sock, WRONG_DATA)
             print_logs((sock, 'memory info operation not permitted for this user/node'), DEBUG_MODE)
             return
-
         total_b = sock.recv(8)
         free_b = sock.recv(8)
         try:
@@ -487,16 +508,21 @@ class StorageUpdate(threading.Thread):
             self.send_error(sock, WRONG_DATA)
             return
 
-        Node.update({Node.TOTAL_MEMORY: total, Node.FREE_MEMORY: free, Node.ALIVE: 1},
+        if sock in self.memory_request_nodes:
+            Node.update_field({Node.TOTAL_MEMORY: total, Node.FREE_MEMORY: free, Node.ALIVE: 1},
                     {Node.TOKEN: self.memory_request_nodes[sock]})
 
-        self.close_connection(sock, False)
+        if sock not in self.success_repl_nodes and sock not in self.replica_request_nodes.keys():
+            self.success_repl_nodes.append(sock)
+            if sock in self.repl_counter.keys() or self.repl_counter[sock] != 0:
+                self.repl_counter[sock] -= 1
+
+        self.close_connection(sock, False, True, False, False)
 
     def replica_result(self, sock):
         """
         40 | filename[64] T/F[1] rep_ip[4] rep_port[2]
         """
-        # TODO add port-ip data of the replica node in the packet
         filename, response = parse_storage_result_response(sock)
 
         if response == 1:
@@ -516,17 +542,43 @@ class StorageUpdate(threading.Thread):
 
             rep_node = Node.find_one({Node.PORT: port, Node.IP: ip})
 
-            EntityComponent.update(
-                {EntityComponent.STATUS: STATUS_SAVED},
-                {
+            if not rep_node:
+                print_logs((sock, 'replica result', port, ip), DEBUG_MODE)
+                return
+
+            entity_comp = EntityComponent.find_one({EntityComponent.TOKEN: filename})
+            if entity_comp:
+                rep_entity = EntityComponent.find_one({
                     EntityComponent.REPLICA_NUMB: rep_node[Node.NODE_TYPE],
                     EntityComponent.NODE_ID: rep_node[Node.ID],
-                    EntityComponent.STATUS: STATUS_UPDATING
-                }
-            )
+                    EntityComponent.STATUS: STATUS_UPDATING,
+                    EntityComponent.ENTITY_ID: entity_comp[EntityComponent.ENTITY_ID]
+                })
 
-            Node.update({Node.ALIVE: 1},
-                        {Node.ID: self.replica_request_nodes[sock]})
+                if not rep_entity:
+                    rep_entity = EntityComponent.find_one({
+                        EntityComponent.REPLICA_NUMB: rep_node[Node.NODE_TYPE],
+                        EntityComponent.NODE_ID: rep_node[Node.ID],
+                        EntityComponent.STATUS: STATUS_REPLICATING_WAITING,
+                        EntityComponent.ENTITY_ID: entity_comp[EntityComponent.ENTITY_ID],
+                    })
+
+                if rep_entity:
+                    EntityComponent.update_field(
+                        {EntityComponent.STATUS: STATUS_SAVED},
+                        {
+                            EntityComponent.ID: rep_entity[EntityComponent.ID]
+                        }
+                    )
+
+                    if rep_entity[EntityComponent.ID] in self.replicating_components:
+                        self.replicating_components.remove(rep_entity[EntityComponent.ID])
+            if sock in self.replica_request_nodes.keys():
+                self.success_repl_nodes.append(sock)
+                if sock in self.repl_counter.keys() or self.repl_counter[sock] != 0:
+                    self.repl_counter[sock] -= 1
+
+                Node.update_field({Node.ALIVE: 1}, {Node.ID: self.replica_request_nodes[sock]})
 
             self.close_connection(sock, False)
 
@@ -536,7 +588,7 @@ class StorageUpdate(threading.Thread):
         """
         filename, result = parse_storage_result_response(sock)
 
-        if result == 1:
+        if filename:
             print_logs('delete file', DEBUG_MODE)
 
             entity_component = EntityComponent.find_one({
@@ -545,22 +597,25 @@ class StorageUpdate(threading.Thread):
 
             if entity_component:
                 EntityComponent.delete({EntityComponent.ID: entity_component[EntityComponent.ID]})
-                self.close_connection(sock)
-                return
 
-            Node.update({Node.ALIVE: 1},
-                        {Node.ID: self.delete_request_nodes[sock]})
+            if sock in self.delete_request_nodes:
+                Node.update_field({Node.ALIVE: 1}, {Node.ID: self.delete_request_nodes[sock]})
 
-            self.close_connection(sock, False)
+            if sock not in self.success_repl_nodes and sock not in self.replica_request_nodes.keys():
+                self.success_repl_nodes.append(sock)
+                if sock in self.repl_counter.keys() or self.repl_counter[sock] != 0:
+                    self.repl_counter[sock] -= 1
+
+            self.close_connection(sock, False, clear_replica=False)
 
     def connect_to_nodes(self):
         nodes = Node.find_many()
 
-        entity_components = EntityComponent.find_many({
+        entity_components_rep = EntityComponent.find_many({
             EntityComponent.STATUS: STATUS_REPLICATING
         })
 
-        r_1_list, r_2_list = create_replicated_components(entity_components)
+        r_1_list, r_2_list = create_replicated_components(entity_components_rep)
 
         for node in nodes:
             out_sock = self.create_connection(node)
@@ -570,6 +625,13 @@ class StorageUpdate(threading.Thread):
                 """
                 data = node[Node.TOKEN].encode()
                 self.send_request(out_sock, node, STORAGE_GET_MEMORY_INFO, data)
+                if out_sock not in self.repl_counter.keys():
+                    self.repl_counter[out_sock] = 1
+                else:
+                    self.repl_counter[out_sock] += 1
+
+                if out_sock not in self.memory_request_nodes.keys():
+                    self.memory_request_nodes[out_sock] = node[Node.TOKEN]
 
                 """
                 23 | token[128] filename[64]  | ns to storage - delete file
@@ -583,35 +645,87 @@ class StorageUpdate(threading.Thread):
                 for component in entity_components:
                     data = node[Node.TOKEN].encode() + component[EntityComponent.TOKEN].encode() + \
                            ipaddress.IPv4Address(node[Node.IP].decode()).packed + struct.pack('<H', node[Node.PORT])
-                    self.send_request(out_sock, node, STORAGE_CREATE_REPLICA_REQUEST, data)
+                    self.send_request(out_sock, node, STORAGE_SEND_DELETE_REQUEST, data)
+                    if out_sock not in self.repl_counter.keys():
+                        self.repl_counter[out_sock] = 1
+                    else:
+                        self.repl_counter[out_sock] += 1
+
+                    if out_sock not in self.delete_request_nodes.keys():
+                        self.delete_request_nodes[out_sock] = node[Node.TOKEN]
+
+                entities_replicating = EntityComponent.find_many({
+                    EntityComponent.NODE_ID: node[Node.ID],
+                    EntityComponent.STATUS: STATUS_SAVED
+                })
+
+                try:
+                    for ent in entities_replicating:
+                        entities_waiting = EntityComponent.find_many({
+                            EntityComponent.ENTITY_ID: ent[EntityComponent.ENTITY_ID],
+                            EntityComponent.FILE_ORDER: ent[EntityComponent.FILE_ORDER],
+                            EntityComponent.STATUS: STATUS_REPLICATING_WAITING
+                        })
+
+                        for wait in entities_waiting:
+                            if wait[EntityComponent.ID] not in self.replicating_components:
+                                nd = Node.find_one({Node.ID: wait[EntityComponent.NODE_ID]})
+                                data = node[Node.TOKEN].encode() + \
+                                       ipaddress.IPv4Address(nd[Node.IP].decode()).packed + struct.pack('<H', nd[Node.PORT]) \
+                                       + wait[EntityComponent.TOKEN].encode()
+                                self.send_request(out_sock, node, STORAGE_CREATE_REPLICA_REQUEST, data)
+                                self.replicating_components.append(wait[EntityComponent.ID])
+                                if out_sock not in self.replica_request_nodes.keys():
+                                    self.replica_request_nodes[out_sock] = node[Node.TOKEN]
+                                    if out_sock not in self.repl_counter.keys():
+                                        self.repl_counter[out_sock] = 1
+                                    else:
+                                        self.repl_counter[out_sock] += 1
+                except:
+                    print_logs(("bad selection on replicas waiting"), DEBUG_MODE)
 
                 if node[Node.NODE_TYPE] == NODE_TYPE_MAIN:
                     """
                     39 | token[128] filename[64] node_ip[4] node_port[2]
                     """
-
+                    node_token = node[Node.TOKEN].encode()
+                    add_node = False
                     if node[Node.ID] in r_1_list.keys():
+                        add_node = True
                         for itm in r_1_list[node[Node.ID]]:
-                            self.send_request(out_sock, node, STORAGE_CREATE_REPLICA_REQUEST, itm)
+                            self.send_request(out_sock, node, STORAGE_CREATE_REPLICA_REQUEST, node_token+itm[0])
+                            if itm[1] not in self.replicating_components:
+                                self.replicating_components.append(itm[1])
+                                if out_sock not in self.repl_counter.keys():
+                                    self.repl_counter[out_sock] = 1
+                                else:
+                                    self.repl_counter[out_sock] += 1
 
                     if node[Node.ID] in r_2_list.keys():
+                        add_node = True
                         for itm in r_2_list[node[Node.ID]]:
-                            self.send_request(out_sock, node, STORAGE_CREATE_REPLICA_REQUEST, itm)
+                            self.send_request(out_sock, node, STORAGE_CREATE_REPLICA_REQUEST, node_token+itm[0])
+                            if itm[1] not in self.replicating_components:
+                                self.replicating_components.append(itm[1])
+                                if out_sock not in self.repl_counter.keys():
+                                    self.repl_counter[out_sock] = 1
+                                else:
+                                    self.repl_counter[out_sock] += 1
+
+                    if out_sock not in self.replica_request_nodes.keys() and add_node:
+                        self.replica_request_nodes[out_sock] = node[Node.TOKEN]
 
     def create_connection(self, node):
         out_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             out_sock.connect((node[Node.IP], node[Node.PORT]))
         except socket.error:
-            Node.update({Node.ALIVE: 0}, {Node.TOKEN: node[Node.TOKEN]})
+            Node.update_field({Node.ALIVE: 0}, {Node.TOKEN: node[Node.TOKEN]})
             print_logs(('cannot connect to the node,', node[Node.IP], node[Node.PORT], node[Node.TOKEN]), DEBUG_MODE)
             return False
 
         self.connections.append(out_sock)
         self.authorized_nodes.append(out_sock)
-        self.delete_request_nodes[out_sock] = node[Node.TOKEN]
-        self.replica_request_nodes[out_sock] = node[Node.TOKEN]
-        self.memory_request_nodes[out_sock] = node[Node.TOKEN]
 
         return out_sock
 
@@ -625,21 +739,46 @@ class StorageUpdate(threading.Thread):
                      'packet id: ' + str(message_type)), DEBUG_MODE)
 
     def clear_connections(self):
+        close_sockets = []
         for n_socket in self.memory_request_nodes.keys():
-            print_logs(('close connection with', n_socket, 'memory info'))
-            self.close_connection(n_socket, True, False)
+            print_logs(('close connection with', n_socket, 'memory info'), False)
+            self.close_connection(n_socket, True, False, False, clear_replica=False)
+            close_sockets.append(n_socket)
 
-        for n_socket in self.replica_request_nodes.keys():
-            print_logs(('close connection with', n_socket, 'replica request'))
-            self.close_connection(n_socket, True, False)
+            if n_socket in self.connections:
+                self.connections.remove(n_socket)
 
         for n_socket in self.delete_request_nodes.keys():
-            print_logs(('close connection with', n_socket, 'memory info'))
-            self.close_connection(n_socket, True, False)
+            print_logs(('close connection with', n_socket, 'memory info'), False)
+            self.close_connection(n_socket, True, False, False, clear_replica=False)
+            if n_socket in self.connections:
+                self.connections.remove(n_socket)
 
         self.memory_request_nodes = {}
-        self.replica_request_nodes = {}
         self.delete_request_nodes = {}
+
+        for sock in close_sockets:
+            if sock not in self.replica_request_nodes.keys():
+                if sock in self.connections:
+                    self.connections.remove(sock)
+                try:
+                    sock.close()
+                except:
+                    pass
+
+        new_success = []
+        for sock in self.success_repl_nodes:
+            if sock not in self.repl_counter.keys() or self.repl_counter[sock] == 0:
+                if sock in self.connections:
+                    self.connections.remove(sock)
+                try:
+                    sock.close()
+                except:
+                    pass
+            else:
+                new_success.append(sock)
+
+        self.success_repl_nodes = new_success[:]
 
 
 class NamingServer(threading.Thread):
@@ -652,9 +791,6 @@ class NamingServer(threading.Thread):
         self.authorized_nodes = []
         self.failed_node_info = {}
         self.update_event = None
-
-        self.storage_update_thread = StorageUpdate()
-        self.storage_update_thread.start()
 
     def run(self):
         self._bind_socket()
@@ -669,7 +805,9 @@ class NamingServer(threading.Thread):
                 except:
                     print_logs((connection, 'socket already closed'), DEBUG_MODE)
 
-        self.storage_update_thread.stop()
+        global storage_update_thread
+        if storage_update_thread:
+            storage_update_thread.stop()
 
     def send_error(self, sock, error_code):
         result = send_error(sock, error_code)
@@ -699,7 +837,7 @@ class NamingServer(threading.Thread):
             print_logs(('Cannot bind to the given host and port (%s, %i): %s' % (self.host, self.port, msg)), DEBUG_MODE)
             sys.exit()
         else:
-            print_logs('NS is up ([q] to exit)', DEBUG_MODE)
+            print_logs('NS is up ([q] to exit)')
             self.ns_socket.listen(MAX_CONNECTIONS_NUMBER)
             self.connections.append(self.ns_socket)
 
@@ -736,7 +874,6 @@ class NamingServer(threading.Thread):
 
     def _receive(self, sock):
         start, package_id = read_header(sock, 'NamingServer')
-
         if not (start and package_id):
             self.close_connection(sock)
             return
@@ -746,7 +883,7 @@ class NamingServer(threading.Thread):
         elif package_id == STORAGE_CLIENT_PERMISSION:  # storage to ns - check client-file permissions
             self.client_permission_request(sock)
         elif package_id == ERROR_MSG:  # errors
-            self.error_received(sock)
+            error_received(sock)
         elif package_id == CLIENT_REQUEST_AUTH:  # client to ns - auth
             self.auth_client(sock)
         elif package_id == CLIENT_REQUEST_TREE:  # client to ns - request the tree
@@ -807,7 +944,7 @@ class NamingServer(threading.Thread):
                 Node.PORT: port,
                 Node.ALIVE: 1
             }
-            Node.update(params, {Node.TOKEN: token})
+            Node.update_field(params, {Node.TOKEN: token})
 
         self.authorized_nodes.append(sock)
         self.send_handshake_response(sock, token, RESPONSE_OK)
@@ -854,21 +991,6 @@ class NamingServer(threading.Thread):
         self.send_client_permission_response(sock, client_token, filename, False)
         print_logs((sock, client_token, filename, 'client', ERROR_TEXT[PERMISSION_DENIED]), DEBUG_MODE)
 
-    def error_received(self, sock):
-        """
-        6  | error_code[1]  | for different errors
-        """
-        error = sock.recv(1)
-        try:
-            error_code, = struct.unpack('<B', error)
-        except struct.error as msg:
-            print_logs((sock, msg), DEBUG_MODE)
-        else:
-            if error_code in ERROR_TEXT:
-                print_logs(('The error was received: ' + ERROR_TEXT[error_code]))
-            else:
-                print_logs(('Some unfamiliar error was received. Code ' + str(error_code)))
-
     def rename_request(self, sock):
         """
         19 | token[128] size[2] srcfilepath size[2] dstfilepath | client to ns - rename file request
@@ -883,7 +1005,7 @@ class NamingServer(threading.Thread):
 
         srcfilepath = self.read_data(sock, 2)
         dstfilepath = self.read_data(sock, 2)
-
+        print srcfilepath, dstfilepath
         entities = Entity.find_many(
             {
                 Entity.USER_ID: user[User.ID],
@@ -906,7 +1028,7 @@ class NamingServer(threading.Thread):
 
             newfilepath = string.replace(entity[Entity.FILEPATH], srcfilepath, dstfilepath, 1)
 
-            Entity.update(
+            Entity.update_field(
                 {Entity.FILEPATH: newfilepath},
                 {Entity.ID: entity[Entity.ID]}
             )
@@ -957,10 +1079,10 @@ class NamingServer(threading.Thread):
                 send_error(sock, NOT_ENOUGH_PLACE)
                 return
 
-            if login_length < 3 or pass_length < 6 or re.search("[^a-zA-Z0-9]+", login + passwd):
-                print_logs("user entered inappropriate login/password", DEBUG_MODE)
-                send_error(sock, WRONG_DATA)
-                return
+            #if login_length < 3 or pass_length < 6 or re.search("[^a-zA-Z0-9]+", login + passwd):
+            #    print_logs("user entered inappropriate login/password", DEBUG_MODE)
+            #    send_error(sock, WRONG_DATA)
+            #    return
 
             token = binascii.b2a_hex(os.urandom(FILENAME_SIZE))
             User.add_user(token, login, passwd)
@@ -976,7 +1098,7 @@ class NamingServer(threading.Thread):
                 return
 
             token = binascii.b2a_hex(os.urandom(FILENAME_SIZE))
-            User.update({User.LAST_LOGIN_TIME: time.time(), User.TOKEN: token}, {User.ID: user[User.ID]})
+            User.update_field({User.LAST_LOGIN_TIME: time.time(), User.TOKEN: token}, {User.ID: user[User.ID]})
 
         self.send_token(sock, token)
 
@@ -999,7 +1121,7 @@ class NamingServer(threading.Thread):
             print_logs((sock, ERROR_TEXT[NOT_FOUND]), DEBUG_MODE)
             return
 
-        User.update(
+        User.update_field(
             {User.LAST_LOGIN_TIME: time.time() - 1000},
             {User.ID: user[User.ID]}
         )
@@ -1102,7 +1224,7 @@ class NamingServer(threading.Thread):
                 entity = Entity.find_one({Entity.ID: entity_component[EntityComponent.ENTITY_ID]})
 
                 if entity:
-                    EntityComponent.update(
+                    EntityComponent.update_field(
                         {EntityComponent.STATUS: STATUS_REPLICATING},
                         {EntityComponent.ID: entity_component[EntityComponent.ID]}
                     )
@@ -1118,7 +1240,7 @@ class NamingServer(threading.Thread):
                     })
 
                     if len(updating_components) == 0:
-                        EntityComponent.update(
+                        EntityComponent.update_field(
                             {EntityComponent.STATUS: STATUS_DELETED},
                             {EntityComponent.STATUS: STATUS_OLD, EntityComponent.ENTITY_ID: entity[Entity.ID]}
                         )
@@ -1131,10 +1253,11 @@ class NamingServer(threading.Thread):
                             Entity.FILESIZE_NEW: None
                         }
 
-                        Entity.update(
+                        Entity.update_field(
                             entity_data,
                             {Entity.ID: entity[Entity.ID]}
                         )
+
                         print_logs(('Entity was saved', entity[Entity.ID]), DEBUG_MODE)
 
                     self.close_connection(sock)
@@ -1152,7 +1275,7 @@ class NamingServer(threading.Thread):
         if user is False:
             return
         else:
-            User.update({User.LAST_LOGIN_TIME: time.time()}, {User.ID: user[User.ID]})
+            User.update_field({User.LAST_LOGIN_TIME: time.time()}, {User.ID: user[User.ID]})
 
     def delete_request(self, sock):
         """
@@ -1166,7 +1289,9 @@ class NamingServer(threading.Thread):
         filepath = self.read_data(sock, 2)
 
         entities = Entity.find_many(
-            {Entity.USER_ID: user['id'], Entity.FILEPATH: {' LIKE ': filepath + '%'}},
+            {Entity.USER_ID: user['id'], Entity.FILEPATH:
+                {' LIKE ': filepath + '%'} if filepath[-1] == '/' else {'=': filepath},
+            },
             [
                 Entity.ID, Entity.STATUS, Entity.FILEPATH, Entity.CREATED,
                 Entity.MODIFIED, Entity.ACCESSED, Entity.FILESIZE
@@ -1185,13 +1310,13 @@ class NamingServer(threading.Thread):
                          )
                     send_error(sock, FILE_CURRENTLY_UPDATING)
                 else:
-                    EntityComponent.update(
+                    EntityComponent.update_field(
                         {EntityComponent.STATUS: STATUS_DELETED, EntityComponent.ENTITY_ID: 0},
                         {EntityComponent.ENTITY_ID: entity[Entity.ID], EntityComponent.STATUS: {'<>': STATUS_DELETED}}
                     )
                     print_logs((filepath, user['id'], sock, 'file was removed (and subfiles if exist)'), DEBUG_MODE)
 
-                    User.update({User.MEMORY: user[User.MEMORY] - entity[Entity.FILESIZE]}, {User.ID: user[User.ID]})
+                    User.update_field({User.MEMORY: user[User.MEMORY] - entity[Entity.FILESIZE]}, {User.ID: user[User.ID]})
                     Entity.delete({Entity.ID: entity[Entity.ID]})
                     self.send_delete_response(sock, filepath, True)
 
@@ -1208,7 +1333,12 @@ class NamingServer(threading.Thread):
         10 | total[1] number[1] datasize[2] data | ns to client - send the tree
         """
         tree = Entity.find_many(
-            {Entity.USER_ID: user[User.ID], Entity.STATUS: STATUS_UPDATING},
+            {
+                Entity.USER_ID: user[User.ID],
+             Entity.STATUS: {
+                 '<>': STATUS_UPDATING
+             }
+            },
             [Entity.FILEPATH, Entity.CREATED, Entity.MODIFIED, Entity.ACCESSED, Entity.FILESIZE]
         )
 
@@ -1216,6 +1346,8 @@ class NamingServer(threading.Thread):
             'total': USER_SPACE,
             'free': USER_SPACE - user[User.MEMORY]
         })
+
+        print_logs(tree, DEBUG_MODE)
 
         json_tree = json.dumps(tree)
 
@@ -1226,7 +1358,7 @@ class NamingServer(threading.Thread):
         14 | total[1] number[1] datasize[2] data | ns to client - send file's chunks locations
         """
         entity = Entity.find_one(
-            {Entity.USER_ID: userid, Entity.FILEPATH: filepath, Entity.STATUS: STATUS_UPDATING},
+            {Entity.USER_ID: userid, Entity.FILEPATH: filepath, Entity.STATUS: {'<>': STATUS_UPDATING}},
             [Entity.ID, Entity.STATUS, Entity.FILEPATH, Entity.CREATED, Entity.MODIFIED, Entity.ACCESSED, Entity.FILESIZE]
         )
 
@@ -1251,7 +1383,7 @@ class NamingServer(threading.Thread):
 
         for entity_component in entity_components:
             if entity_component[EntityComponent.ID] not in count_available_replicas.keys():
-                entity_component[EntityComponent.ID] = 0
+                count_available_replicas[entity_component[EntityComponent.ID]] = 0
 
             tmp_node = Node.find_one({
                 Node.ID: entity_component[EntityComponent.NODE_ID],
@@ -1273,10 +1405,15 @@ class NamingServer(threading.Thread):
             if count_available_replicas[entity_component[EntityComponent.ID]] == 1:
                 offset += entity_component[EntityComponent.CHUNK_SIZE]
 
-        if 0 in count_available_replicas.values():
-            print_logs("File could not be downloaded. Some nodes are not available", DEBUG_MODE)
-            send_error(sock, NOT_FOUND)
-            return
+        # counter = 0
+        # for item in count_available_replicas:
+        #     if count_available_replicas[item] != 0:
+        #         counter += 1
+        #
+        # if counter == 0:
+        #     print_logs("File could not be downloaded. Some nodes are not available", DEBUG_MODE)
+        #     send_error(sock, NOT_FOUND)
+        #     return
 
         entity.pop(Entity.ID, None)
         entity.pop(Entity.STATUS, None)
@@ -1393,18 +1530,20 @@ class NamingServer(threading.Thread):
     def separate_on_chunks(self, free_places, filesize):
         # !!!!! WARNING !!!!! Not clever file splitter
 
-        totally_free = sum(free_places.values())
+        totally_free = sum(free_places)
         if totally_free < filesize:
             return False
 
-        rel_places = {item: int(math.floor(filesize * free_places[item] / float(totally_free))) for item in free_places}
+        rel_places = [int(math.floor(filesize * item / float(totally_free))) for item in free_places]
 
-        diff = filesize - sum(rel_places.values())
+        diff = filesize - sum(rel_places)
 
-        while diff > 0:
-            for item in free_places.keys():
-                if rel_places[item] < free_places[item] and not rel_places[item] is 0:
-                    rel_places[item] += 1
+        i = 0
+        while diff > 0 and i < len(free_places):
+            if rel_places[i] < free_places[i] and not rel_places[i] is 0:
+                rel_places[i] += 1
+                diff -= 1
+            i += 1
 
         return rel_places
 
@@ -1436,9 +1575,9 @@ class NamingServer(threading.Thread):
             [Entity.ID, Entity.STATUS, Entity.FILEPATH, Entity.CREATED, Entity.MODIFIED, Entity.ACCESSED, Entity.FILESIZE]
         )
 
-        busy_memory = user[User.MEMORY]
+        busy_memory = user[User.MEMORY] + metadata['filesize']
         if entity_file:
-            busy_memory = busy_memory - entity_file[Entity.FILESIZE] + metadata['filesize']
+            busy_memory = busy_memory - entity_file[Entity.FILESIZE]
 
         if busy_memory > USER_SPACE:
             print_logs(("User dont have enough place available", user[User.ID], sock), DEBUG_MODE)
@@ -1446,7 +1585,7 @@ class NamingServer(threading.Thread):
             return
 
         nodes = Node.find_many({Node.ALIVE: 1, Node.NODE_TYPE: NODE_TYPE_MAIN})
-        free_places = {node[Node.ID]: node[Node.FREE_MEMORY] for node in nodes if node[Node.FREE_MEMORY]}
+        free_places = [node[Node.FREE_MEMORY] for node in nodes if node[Node.FREE_MEMORY]]
         chunk_sizes = self.separate_on_chunks(free_places, metadata['filesize'])
 
         if chunk_sizes is False:
@@ -1461,7 +1600,7 @@ class NamingServer(threading.Thread):
             )
 
             if metadata['filesize']:
-                user.update({User.MEMORY: busy_memory}, {User.ID: user[User.ID]})
+                User.update_field({User.MEMORY: busy_memory}, {User.ID: user[User.ID]})
 
         elif entity_file[Entity.STATUS] == STATUS_UPDATING:
             print_logs(("User", user['id'], 'cannot update file', filepath + '. File is currently updating.'), DEBUG_MODE)
@@ -1470,7 +1609,7 @@ class NamingServer(threading.Thread):
         else:
             entity_id = entity_file[Entity.ID]
 
-            Entity.update(
+            Entity.update_field(
                 {
                     Entity.FILESIZE: metadata['filesize'],
                     Entity.ACCESSED: metadata['accessed'],
@@ -1479,9 +1618,9 @@ class NamingServer(threading.Thread):
                 },
                 {Entity.ID: entity_id}
             )
-            user.update({User.MEMORY: busy_memory}, {User.ID: user[User.ID]})
+            User.update_field({User.MEMORY: busy_memory}, {User.ID: user[User.ID]})
 
-            EntityComponent.update(
+            EntityComponent.update_field(
                 {EntityComponent.STATUS: STATUS_OLD},
                 {EntityComponent.ENTITY_ID: entity_id, EntityComponent.STATUS: {"<>": STATUS_DELETED}}
             )
@@ -1500,23 +1639,23 @@ class NamingServer(threading.Thread):
             metadata.pop('filesize', None)
             offset = 0
             i = 1
-            for node_id in chunk_sizes.keys():
+            for ind in range(len(chunk_sizes)):
                 filename = EntityComponent.add(
-                    entity_id, node_id, i,
-                    NODE_TYPE_MAIN, STATUS_UPDATING, chunk_sizes[node_id]
+                    entity_id, nodes[ind][Node.ID], i,
+                    NODE_TYPE_MAIN, STATUS_UPDATING, chunk_sizes[ind]
                 )
 
                 metadata['components'].append({
                     'filename': filename,
-                    'filesize': chunk_sizes[node_id],
-                    'ip': nodes[node_id][Node.IP],
-                    'port': nodes[node_id][Node.PORT],
+                    'filesize': chunk_sizes[ind],
+                    'ip': nodes[ind][Node.IP],
+                    'port': nodes[ind][Node.PORT],
                     'file_order': i,
                     'replica': NODE_TYPE_MAIN,
                     'continue': continue_load,
                     'offset': offset
                 })
-                offset += chunk_sizes[node_id]
+                offset += chunk_sizes[ind]
                 i += 1
 
         json_tree = json.dumps(metadata)
@@ -1552,7 +1691,7 @@ class NamingServer(threading.Thread):
             return
 
         # TODO how nodes are sent - field name
-        Node.update({Node.ALIVE: 0}, {
+        Node.update_field({Node.ALIVE: 0}, {
             Node.IP: file_data['node']['ip'], Node.PORT: file_data['node']['port'], Node.NODE_TYPE: NODE_TYPE_MAIN
         })
 
@@ -1564,8 +1703,8 @@ class NamingServer(threading.Thread):
         })
 
         uploaded_ids = [item[EntityComponent.NODE_ID] for item in uploaded_components]
-        free_memory = {node[Node.ID]: node[Node.FREE_MEMORY] for node in nodes
-                       if nodes[EntityComponent.ID] not in uploaded_ids}
+        free_memory = [node[Node.FREE_MEMORY] for node in nodes
+                       if nodes[EntityComponent.ID] not in uploaded_ids]
 
         not_loaded_components = EntityComponent.find_many({
             EntityComponent.ENTITY_ID: entity[Entity.ID],
@@ -1578,7 +1717,7 @@ class NamingServer(threading.Thread):
         continue_load = 1
         if not chunk_sizes:
             for comp in uploaded_components:
-                EntityComponent.update({EntityComponent.STATUS: STATUS_DELETED}, {EntityComponent.ID: comp[EntityComponent.ID]})
+                EntityComponent.update_field({EntityComponent.STATUS: STATUS_DELETED}, {EntityComponent.ID: comp[EntityComponent.ID]})
                 not_loaded_size += comp[EntityComponent.CHUNK_SIZE]
 
             free_memory = {node[Node.ID]: node[Node.FREE_MEMORY] for node in nodes}
@@ -1586,9 +1725,9 @@ class NamingServer(threading.Thread):
             continue_load = 0
             if not chunk_sizes:
                 # TODO possible collision, if file pointed as deleted, but actually - not yet
-                user.update({User.MEMORY: user[User.MEMORY] + entity[Entity.FILESIZE]}, {User.ID: user[User.ID]})
+                User.update_field({User.MEMORY: user[User.MEMORY] + entity[Entity.FILESIZE]}, {User.ID: user[User.ID]})
 
-                EntityComponent.update(
+                EntityComponent.update_field(
                     {EntityComponent.STATUS: STATUS_SAVED},
                     {EntityComponent.STATUS: STATUS_OLD, EntityComponent.ENTITY_ID: entity[Entity.ID]}
                 )
@@ -1599,7 +1738,7 @@ class NamingServer(threading.Thread):
                     Entity.FILESIZE_NEW: None
                 }
 
-                Entity.update(
+                Entity.update_field(
                     entity_data,
                     {Entity.ID: entity[Entity.ID]}
                 )
@@ -1655,8 +1794,8 @@ class User:
         return DBRequests.find_many(User.table_name, params, select_values)
 
     @staticmethod
-    def update(change_to, find_by={}):
-        DBRequests.update(User.table_name, change_to, find_by)
+    def update_field(change_to, find_by={}):
+        DBRequests.update_field(User.table_name, change_to, find_by)
 
     @staticmethod
     def drop_table():
@@ -1726,8 +1865,8 @@ class Entity:
         return DBRequests.find_many(Entity.table_name, params, select_values)
 
     @staticmethod
-    def update(change_to, find_by={}):
-        DBRequests.update(Entity.table_name, change_to, find_by)
+    def update_field(change_to, find_by={}):
+        DBRequests.update_field(Entity.table_name, change_to, find_by)
 
     @staticmethod
     def delete(params):
@@ -1771,8 +1910,8 @@ class EntityComponent:
 
 
     @staticmethod
-    def add(entity_id, node_id, file_order, replica_numb, status, chunk_size):
-        token = binascii.b2a_hex(os.urandom(32))
+    def add(entity_id, node_id, file_order, replica_numb, status, chunk_size, file_token=False):
+        token = file_token if file_token else binascii.b2a_hex(os.urandom(32))
         command = 'INSERT INTO ' + EntityComponent.table_name + ' (id, token, entity_id, node_id, file_order, ' \
                                                                 'replica_numb, status, chunk_size) ' \
                                                                 'VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)'
@@ -1793,8 +1932,8 @@ class EntityComponent:
         DBRequests.drop_table(EntityComponent.table_name)
 
     @staticmethod
-    def update(change_to, find_by={}):
-        DBRequests.update(EntityComponent.table_name, change_to, find_by)
+    def update_field(change_to, find_by={}):
+        DBRequests.update_field(EntityComponent.table_name, change_to, find_by)
 
     @staticmethod
     def delete(params):
@@ -1846,8 +1985,8 @@ class Node:
         return DBRequests.find_many(Node.table_name, params, select_values)
 
     @staticmethod
-    def update(change_to, find_by={}):
-        DBRequests.update(Node.table_name, change_to, find_by)
+    def update_field(change_to, find_by={}):
+        DBRequests.update_field(Node.table_name, change_to, find_by)
 
     @staticmethod
     def drop_table():
@@ -1938,7 +2077,7 @@ class DBRequests:
         return DBRequests.connect_to_db(command + additional_command, args, DB_QUERY_TYPE_SELECT_ALL)
 
     @staticmethod
-    def update(table_name, change_to, find_by={}):
+    def update_field(table_name, change_to, find_by={}):
         set_command, set_args = DBRequests.params_list(change_to, ", ", "? ", " SET")
         where_command, where_args = DBRequests.params_list(find_by, "AND ", "? ", " WHERE")
 
@@ -1976,6 +2115,10 @@ class DBRequests:
 
 def main():
     DBRequests.init_db()
+
+    global storage_update_thread
+    storage_update_thread = StorageUpdate()
+    storage_update_thread.start()
 
     serv = NamingServer('', PORT)
     serv.start()
