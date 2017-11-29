@@ -11,8 +11,8 @@ import hashlib
 import json
 import math
 import time
-from Queue import Queue
-
+import string
+import re
 
 """
 Basic structure: 666+id+data
@@ -99,6 +99,7 @@ ERROR_TEXT = {
     NO_STORAGE_NODE_IS_AVAILABLE: ' No Storage Node Is Available'
 }
 
+HANDSHAKE = 1
 STORAGE_CLIENT_PERMISSION = 4
 STORAGE_SEND_CLIENT_PERMISSION_RESPONSE = 5
 ERROR_MSG = 6
@@ -114,90 +115,79 @@ CLIENT_DELETE_REQUEST = 17
 CLIENT_SEND_DELETE_RESPONSE = 18
 CLIENT_RENAME_REQUEST = 19
 CLIENT_RENAME_RESPONSE = 20
+STORAGE_SEND_FILE = 21
 CLIENT_FILE_SAVE_RESULT = 22
 STORAGE_SEND_DELETE = 23
 STORAGE_GET_DELETE_RESPONSE = 24
 STORAGE_GET_MEMORY_INFO = 29
 STORAGE_MEMORY_INFO_RESULT = 30
+STORAGE_HANDSHAKE_RESPONSE = 31
 CLIENT_KEEP_ALIVE = 34
 CLIENT_LOGOUT = 37
 CLIENT_NODE_FAILED_REQUEST = 38
-
-STORAGE_HANDSHAKE = 1
-STORAGE_HANDSHAKE_RESPONSE = 31
-STORAGE_SEND_FILE = 21
+STORAGE_CREATE_REPLICA_REQUEST = 39
+STORAGE_CREATE_REPLICA_RESPONSE = 40
 
 MEMORY_REQUEST_TIMEOUT = 20
 CLIENT_TIMEOUT = 60
 
 RESPONSE_OK = 1
-RESPONSE_FAILURE =2
+RESPONSE_FAILURE = 2
 
 STATUS_UPDATING = 1
 STATUS_SAVED = 2
 STATUS_OLD = 3
 STATUS_DELETED = 4
+STATUS_REPLICATING = 5
 
 DATA_SIZE = 4096
 DATA_SIZE_PACKED = struct.pack('<h', DATA_SIZE)
 
 FILENAME_SIZE = 64
 
-storage_update_thread = None
+REPLICAS_NUMBER = 3
 
-def dict_factory(cur, row):
-    d = {}
-    for idx, col in enumerate(cur.description):
-        d[col[0]] = row[idx]
-    return d
+NODE_TYPE_MAIN = 1
+NODE_TYPE_REPLICA_1 = 2
+NODE_TYPE_REPLICA_2 = 3
 
+USER_SPACE = 20 * 2**30  # 20GB
 
-def init_db():
-    conn, cur = connect_to_db()
-    User.create_table(cur)
-    conn.commit()
+DB_QUERY_TYPE_INSERT = 1
+DB_QUERY_TYPE_SELECT_ONE = 2
+DB_QUERY_TYPE_SELECT_ALL = 3
+DB_QUERY_TYPE_OTHER = 4
 
-    UserToken.create_table(cur)
-    conn.commit()
-
-    Entity.create_table(cur)
-    conn.commit()
-
-    EntityComponent.create_table(cur)
-    conn.commit()
-
-    Node.create_table(cur)
-    conn.commit()
-
-    conn.close()
-
-
-def connect_to_db():
-    conn = sqlite3.connect("db/nameserver.db")
-    conn.row_factory = dict_factory
-    cur = conn.cursor()
-    return conn, cur
-
-
-def send_error(sock, error_code):
-    """
-    6  | error_code[1]  | for different errors
-    """
-    data = struct.pack('<B', error_code)
-    send(sock, ERROR_MSG, data)
+DEBUG_MODE = True
 
 
 def send(sock, package_id, data):
     # TODO check if user still connected
     header = struct.pack('<hB', 666, package_id)
-    sock.send(header + data)
+    try:
+        sock.send(header + data)
+    except:
+        print 'Error while message sending'
+        return False
+
+    return True
+
+
+def send_error(sock, error_code):
+        """
+        6  | error_code[1]  | for different errors
+        """
+        data = struct.pack('<B', error_code)
+        result = send(sock, ERROR_MSG, data)
+
+        return result
 
 
 def read_header(sock, obj):
     try:
         msg_start = sock.recv(3)
     except socket.error as (code, msg):
-        print obj, code, msg, sock
+        logging((obj, code, msg, sock), DEBUG_MODE)
         # if code == 104:
         #     self.connections.remove(sock)
         return False, False
@@ -208,41 +198,219 @@ def read_header(sock, obj):
     try:
         start, package_id = struct.unpack('<hB', msg_start)
     except struct.error as msg:
-        print obj, "Wrong header in the package", msg, sock
+        logging((obj, "Wrong header in the package", msg, sock), DEBUG_MODE)
         return False, False
 
-    print start, package_id
+    logging((obj, start, package_id, sock), DEBUG_MODE)
 
     if start != 666:
-        print obj, "This is not devilish package"
+        logging((obj, "This is not devilish package"))
         return False, False
 
     return start, package_id
 
 
+def string_decoding(sock, full_size, block_size):
+    data = ""
+
+    while len(data) < full_size:
+        tmp = sock.recv(block_size)
+        if tmp == "":
+            return False
+        data += tmp
+
+    try:
+        res = data.decode()
+    except UnicodeDecodeError:
+        return False
+
+    return res
+
+
+def parse_storage_result_response(sock):
+    filename = string_decoding(sock, FILENAME_SIZE, FILENAME_SIZE)
+
+    if filename is False:
+        send_error(sock, WRONG_DATA)
+        logging((sock, ERROR_TEXT[WRONG_DATA], 'filename'), DEBUG_MODE)
+        return False, False
+
+    data = sock.recv(1)
+    try:
+        result, = struct.unpack('<B', data)
+    except struct.error as msg:
+        send_error(sock, WRONG_DATA)
+        logging((sock, msg, ERROR_TEXT[WRONG_DATA]), DEBUG_MODE)
+        return False, False
+
+    return filename, result
+
+
+def logging(message, debug=True):
+    if debug:
+        print time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()), message
+
+
+def create_replicated_components(entity_components):
+
+    indexed_components = {}
+    for item in entity_components:
+        if item[EntityComponent.ENTITY_ID] in indexed_components:
+            item[EntityComponent.ENTITY_ID].append(item)
+        else:
+            item[EntityComponent.ENTITY_ID] = [item]
+
+    nodes_r_1 = Node.find_many({Node.NODE_TYPE: NODE_TYPE_REPLICA_1})
+    free_space_1_list = [item[Node.FREE_MEMORY] for item in nodes_r_1]
+    free_space_1 = sum(free_space_1_list)
+
+    nodes_r_2 = Node.find_many({Node.NODE_TYPE: NODE_TYPE_REPLICA_2})
+    free_space_2_list = [item[Node.FREE_MEMORY] for item in nodes_r_2]
+    free_space_2 = sum(free_space_2_list)
+
+    result_list_1 = {}
+    r_1_append_size_list = {}
+
+    result_list_2 = {}
+    r_2_append_size_list = {}
+
+    for ent_file in indexed_components:
+        chunk_sizes = sorted([comp[EntityComponent.CHUNK_SIZE] for comp in ent_file])
+        required_size = sum(chunk_sizes)
+
+        if required_size < free_space_1:
+            success, tmp_size_list, tmp_result_list = \
+                count_for_replica(ent_file, chunk_sizes, nodes_r_1, r_1_append_size_list, result_list_1)
+
+            if success:
+                free_space_1 -= required_size
+                for sz in tmp_size_list.keys():
+                    if sz not in r_1_append_size_list.keys():
+                        r_1_append_size_list[sz] = 0
+                    r_1_append_size_list[sz] += tmp_size_list[sz]
+
+                for item_key in tmp_result_list.keys():
+                    if item_key not in result_list_1.keys():
+                        result_list_1[item_key] = []
+                    result_list_1[item_key] += tmp_result_list[item_key]
+
+        if required_size < free_space_2:
+            success, tmp_size_list, tmp_result_list = \
+                count_for_replica(ent_file, chunk_sizes, nodes_r_2, r_2_append_size_list, result_list_2)
+
+            if success:
+                free_space_2 -= required_size
+                for sz in tmp_size_list.keys():
+                    if sz not in r_1_append_size_list.keys():
+                        r_1_append_size_list[sz] = 0
+                    r_1_append_size_list[sz] += tmp_size_list[sz]
+
+                for item_key in tmp_result_list.keys():
+                    if item_key not in result_list_1.keys():
+                        result_list_1[item_key] = []
+                    result_list_1[item_key] += tmp_result_list[item_key]
+
+    return result_list_1, result_list_2
+
+
+def count_for_replica(ent_file, chunk_sizes, nodes_r, r_append_size_list, result_list_r):
+    tmp_list = []
+    success = True
+    tmp_r_append_size_list = r_append_size_list.copy()
+    tmp_result_list_r = result_list_r.copy()
+    for size in chunk_sizes:
+        tmp_node_id = 0
+        tmp_size = 0
+        for node in nodes_r:
+            if tmp_node_id not in tmp_r_append_size_list.keys():
+                tmp_r_append_size_list[tmp_node_id] = 0
+
+            node_free = node[Node.FREE_MEMORY] - tmp_r_append_size_list[tmp_node_id]
+
+            if node_free > size and (node_free < tmp_size or tmp_size is 0):
+                tmp_node_id = node[Node.ID]
+                tmp_size = node_free
+
+        if tmp_size == 0:
+            success = False
+            break
+
+        tmp_list.append((size, tmp_node_id))
+        tmp_r_append_size_list[tmp_node_id] += tmp_size
+
+    if success:
+        for comp in ent_file:
+            rm_item = 0
+            for size_item in tmp_list:
+                if comp[EntityComponent.CHUNK_SIZE] == size_item[0]:
+                    EntityComponent.add(
+                        comp[EntityComponent.ENTITY_ID], size_item[1], comp[EntityComponent.FILE_ORDER],
+                        NODE_TYPE_REPLICA_1, STATUS_UPDATING, size_item[0]
+                    )
+
+                    rm_item = size_item
+                    if size_item[1] not in tmp_result_list_r.keys():
+                        tmp_result_list_r[size_item[1]] = []
+
+                        tmp_result_list_r[size_item[1]].append(
+                            comp[EntityComponent.TOKEN].encode() +
+                            ipaddress.IPv4Address(nodes_r[Node.ID][Node.IP].decode()).packed +
+                            struct.pack('<H', nodes_r[Node.ID][Node.PORT])
+                        )
+
+                    break
+            tmp_list.remove(rm_item)
+
+    return success, tmp_r_append_size_list, tmp_result_list_r
+
+
 class StorageUpdate(threading.Thread):
-    # TODO delete old data from storage once in an hour
     def __init__(self):
         threading.Thread.__init__(self)
         self.connections = []
         self.running = threading.Event()
         self.authorized_nodes = []
         self.memory_request_nodes = {}
-        self.memory_info_received = 0
+        self.delete_request_nodes = {}
+        self.replica_request_nodes = {}
         self.timer = None
 
     def run(self):
+        self.connect_to_nodes()
         self._run()
 
-    def close_connection(self, sock):
-        print "memory, Client disconnected: ", sock
+    def send_error(self, sock, error_code):
+        result = send_error(sock, error_code)
+
+        if not result:
+            self.close_connection(sock)
+
+    def close_connection(self, sock, failed_node=True, clear_dict=True):
+        logging(("memory, Client disconnected: ", sock), DEBUG_MODE)
+
         if sock in self.authorized_nodes:
             self.authorized_nodes.remove(sock)
 
         if sock in self.memory_request_nodes.keys():
-            conn, cur = connect_to_db()
-            Node.update_node(conn, cur, self.memory_request_nodes[sock], {'alive': 0})
-            self.memory_request_nodes.pop(sock, None)
+            if failed_node:
+                Node.update({Node.ALIVE: 0}, {Node.TOKEN: self.memory_request_nodes[sock]})
+
+            if clear_dict:
+                self.memory_request_nodes.pop(sock, None)
+
+        if sock in self.replica_request_nodes.keys():
+            if failed_node:
+                Node.update({Node.ALIVE: 0}, {Node.TOKEN: self.replica_request_nodes[sock]})
+
+            if clear_dict:
+                self.replica_request_nodes.pop(sock, None)
+
+        if sock in self.delete_request_nodes.keys():
+            if failed_node:
+                Node.update({Node.ALIVE: 0}, {Node.TOKEN: self.delete_request_nodes[sock]})
+
+            if clear_dict:
+                self.delete_request_nodes.pop(sock, None)
 
         if sock in self.connections:
             self.connections.remove(sock)
@@ -258,7 +426,7 @@ class StorageUpdate(threading.Thread):
             try:
                 connection.close()
             except:
-                print connection, 'memory, socket already closed'
+                logging((connection, 'memory, socket already closed'), DEBUG_MODE)
 
         if self.timer:
             self.timer.set()
@@ -266,12 +434,12 @@ class StorageUpdate(threading.Thread):
     def _run(self):
         while not self.running.is_set():
             self.timer = threading.Event()
-            self.get_nodes_memory_info()
+            self.connect_to_nodes()
 
             try:
-                ready_to_read, ready_to_write, in_error = select.select(self.connections, [], [], 2)
+                ready_to_read, ready_to_write, in_error = select.select(self.connections, [], [], 10)
             except socket.error as msg:
-                print msg
+                logging(msg, DEBUG_MODE)
                 continue
 
             for sock in ready_to_read:
@@ -283,8 +451,15 @@ class StorageUpdate(threading.Thread):
 
                 if package_id == STORAGE_MEMORY_INFO_RESULT:  # storage to ns - send memory information
                     self.memory_info_result(sock)
+                elif package_id == STORAGE_GET_DELETE_RESPONSE:
+                    self.delete_result(sock)
+                elif package_id == STORAGE_CREATE_REPLICA_RESPONSE:
+                    self.replica_result(sock)
                 else:
-                    send_error(sock, WRONG_DATA)
+                    logging(('StorageUpdate', 'wrong command'), DEBUG_MODE)
+                    self.send_error(sock, WRONG_DATA)
+
+            self.clear_connections()
 
             if self.timer.wait(MEMORY_REQUEST_TIMEOUT):
                 return
@@ -296,8 +471,8 @@ class StorageUpdate(threading.Thread):
         Node.check_node(sock, self.authorized_nodes)
 
         if sock not in self.memory_request_nodes.keys():
-            send_error(sock, WRONG_DATA)
-            print sock, 'memory info operation not permitted for this user/node'
+            self.send_error(sock, WRONG_DATA)
+            logging((sock, 'memory info operation not permitted for this user/node'), DEBUG_MODE)
             return
 
         total_b = sock.recv(8)
@@ -306,73 +481,166 @@ class StorageUpdate(threading.Thread):
             total, = struct.unpack('<Q', total_b)
             free, = struct.unpack('<Q', free_b)
         except struct.error as msg:
-            print sock, msg, ERROR_TEXT[WRONG_DATA]
-            send_error(sock, WRONG_DATA)
+            logging((sock, msg, ERROR_TEXT[WRONG_DATA]), DEBUG_MODE)
+            self.send_error(sock, WRONG_DATA)
             return
 
-        conn, cur = connect_to_db()
-        Node.update_node(conn, cur, self.memory_request_nodes[sock], {
-            'total_memory': total, 'free_memory': free, 'alive': 1})
+        Node.update({Node.TOTAL_MEMORY: total, Node.FREE_MEMORY: free, Node.ALIVE: 1},
+                    {Node.TOKEN: self.memory_request_nodes[sock]})
 
-        self.memory_info_received -= 1
+        self.close_connection(sock, False)
 
-        if sock in self.authorized_nodes:
-            self.authorized_nodes.remove(sock)
-
-        if sock in self.connections:
-            self.connections.remove(sock)
-
-        if sock in self.memory_request_nodes.keys():
-            self.memory_request_nodes.pop(sock, None)
-
-        try:
-            sock.close()
-        except:
-            print sock, 'socket already closed'
-
-    def get_nodes_memory_info(self):
+    def replica_result(self, sock):
         """
-        29 | node_token[128] | ns to storage - get memory information
+        40 | filename[64] T/F[1] rep_ip[4] rep_port[2]
         """
-        #      TODO realisation
+        # TODO add port-ip data of the replica node in the packet
+        filename, response = parse_storage_result_response(sock)
 
-        conn, cur = connect_to_db()
-        nodes = Node.find_nodes(cur)
-
-        for n_socket in self.memory_request_nodes.keys():
+        if response == 1:
+            data = sock.recv(4)
             try:
-                n_socket.close()
-            except:
-                print n_socket, 'socket already closed'
+                ip = ipaddress.IPv4Address(data)
+            except ipaddress.AddressValueError as msg:
+                logging((msg, sock, 'replica result'), DEBUG_MODE)
+                return
 
-            if n_socket in self.connections:
-                self.connections.remove(n_socket)
-            if n_socket in self.authorized_nodes:
-                self.authorized_nodes.remove(n_socket)
+            data = sock.recv(2)
+            try:
+                port, = struct.unpack('<H', data)
+            except struct.error as msg:
+                logging((msg, sock, 'replica result'), DEBUG_MODE)
+                return
 
-        self.memory_request_nodes = {}
+            rep_node = Node.find_one({Node.PORT: port, Node.IP: ip})
+
+            EntityComponent.update(
+                {EntityComponent.STATUS: STATUS_SAVED},
+                {
+                    EntityComponent.REPLICA_NUMB: rep_node[Node.NODE_TYPE],
+                    EntityComponent.NODE_ID: rep_node[Node.ID],
+                    EntityComponent.STATUS: STATUS_UPDATING
+                }
+            )
+
+            Node.update({Node.ALIVE: 1},
+                        {Node.ID: self.replica_request_nodes[sock]})
+
+            self.close_connection(sock, False)
+
+    def delete_result(self, sock):
+        """
+        24 | filename[64] T/F[1]  | storage to ns - file delete result
+        """
+        filename, result = parse_storage_result_response(sock)
+
+        if result == 1:
+            logging('delete file', DEBUG_MODE)
+
+            entity_component = EntityComponent.find_one({
+                EntityComponent.TOKEN: filename,
+            })
+
+            if entity_component:
+                EntityComponent.delete({EntityComponent.ID: entity_component[EntityComponent.ID]})
+                self.close_connection(sock)
+                return
+
+            Node.update({Node.ALIVE: 1},
+                        {Node.ID: self.delete_request_nodes[sock]})
+
+            self.close_connection(sock, False)
+
+    def connect_to_nodes(self):
+        nodes = Node.find_many()
+
+        entity_components = EntityComponent.find_many({
+            EntityComponent.STATUS: STATUS_REPLICATING
+        })
+
+        r_1_list, r_2_list = create_replicated_components(entity_components)
 
         for node in nodes:
-            out_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                out_sock.connect((node['ip'], node['port']))
-            except socket.error:
-                Node.update_node(conn, cur, node['token'], {'alive': 0})
-                print 'cannot connect to the node,', node['ip'], node['port']
-                continue
+            out_sock = self.create_connection(node)
+            if out_sock:
+                """
+                29 | node_token[128] | ns to storage - get memory information
+                """
+                data = node[Node.TOKEN].encode()
+                self.send_request(out_sock, node, STORAGE_GET_MEMORY_INFO, data)
 
-            print out_sock, 'sent'
-            self.connections.append(out_sock)
-            self.authorized_nodes.append(out_sock)
-            self.memory_request_nodes[out_sock] = node['token']
-            data = node['token'].encode()
-            send(out_sock, STORAGE_GET_MEMORY_INFO, data)
+                """
+                23 | token[128] filename[64]  | ns to storage - delete file
+                """
 
-        self.memory_info_received = len(self.memory_request_nodes)
+                entity_components = EntityComponent.find_many({
+                    EntityComponent.NODE_ID: node[Node.ID],
+                    EntityComponent.STATUS: STATUS_DELETED
+                })
+
+                for component in entity_components:
+                    data = node[Node.TOKEN].encode() + component[EntityComponent.TOKEN].encode() + \
+                           ipaddress.IPv4Address(node[Node.IP].decode()).packed + struct.pack('<H', node[Node.PORT])
+                    self.send_request(out_sock, node, STORAGE_CREATE_REPLICA_REQUEST, data)
+
+                if node[Node.NODE_TYPE] == NODE_TYPE_MAIN:
+                    """
+                    39 | token[128] filename[64] node_ip[4] node_port[2]
+                    """
+
+                    if node[Node.ID] in r_1_list.keys():
+                        for itm in r_1_list[node[Node.ID]]:
+                            self.send_request(out_sock, node, STORAGE_CREATE_REPLICA_REQUEST, itm)
+
+                    if node[Node.ID] in r_2_list.keys():
+                        for itm in r_2_list[node[Node.ID]]:
+                            self.send_request(out_sock, node, STORAGE_CREATE_REPLICA_REQUEST, itm)
+
+    def create_connection(self, node):
+        out_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            out_sock.connect((node[Node.IP], node[Node.PORT]))
+        except socket.error:
+            Node.update({Node.ALIVE: 0}, {Node.TOKEN: node[Node.TOKEN]})
+            logging(('cannot connect to the node,', node[Node.IP], node[Node.PORT], node[Node.TOKEN]), DEBUG_MODE)
+            return False
+
+        self.connections.append(out_sock)
+        self.authorized_nodes.append(out_sock)
+        self.delete_request_nodes[out_sock] = node[Node.TOKEN]
+        self.replica_request_nodes[out_sock] = node[Node.TOKEN]
+        self.memory_request_nodes[out_sock] = node[Node.TOKEN]
+
+        return out_sock
+
+    def send_request(self, out_sock, node, message_type, data):
+        result = send(out_sock, message_type, data)
+
+        if not result:
+            self.close_connection(out_sock)
+        else:
+            logging((out_sock, 'sent', node['ip'], node['port'], node['token'],
+                     'packet id: ' + str(message_type)), DEBUG_MODE)
+
+    def clear_connections(self):
+        for n_socket in self.memory_request_nodes.keys():
+            logging(('close connection with', n_socket, 'memory info'))
+            self.close_connection(n_socket, True, False)
+
+        for n_socket in self.replica_request_nodes.keys():
+            logging(('close connection with', n_socket, 'replica request'))
+            self.close_connection(n_socket, True, False)
+
+        for n_socket in self.delete_request_nodes.keys():
+            logging(('close connection with', n_socket, 'memory info'))
+            self.close_connection(n_socket, True, False)
+
+        self.memory_request_nodes = {}
+        self.replica_request_nodes = {}
+        self.delete_request_nodes = {}
 
 
-
-class NameServer(threading.Thread):
+class NamingServer(threading.Thread):
     def __init__(self, host, port):
         threading.Thread.__init__(self)
         self.host = host
@@ -382,6 +650,9 @@ class NameServer(threading.Thread):
         self.authorized_nodes = []
         self.failed_node_info = {}
         self.update_event = None
+
+        self.storage_update_thread = StorageUpdate()
+        self.storage_update_thread.start()
 
     def run(self):
         self._bind_socket()
@@ -394,14 +665,17 @@ class NameServer(threading.Thread):
                 try:
                     connection.close()
                 except:
-                    print connection, 'socket already closed'
+                    logging((connection, 'socket already closed'), DEBUG_MODE)
 
-        global storage_update_thread
-        if storage_update_thread:
-            storage_update_thread.stop()
+        self.storage_update_thread.stop()
+
+    def send_error(self, sock, error_code):
+        result = send_error(sock, error_code)
+        if not result:
+            self.close_connection(sock)
 
     def close_connection(self, sock):
-        print "Client disconnect: ", sock
+        logging(("Client disconnect: ", sock), DEBUG_MODE)
         if sock in self.authorized_nodes:
             self.authorized_nodes.remove(sock)
 
@@ -420,10 +694,10 @@ class NameServer(threading.Thread):
         try:
             self.ns_socket.bind(('', self.port))
         except socket.error as msg:
-            print 'Cannot bind to the given host and port (%s, %i): %s' % (self.host, self.port, msg)
+            logging(('Cannot bind to the given host and port (%s, %i): %s' % (self.host, self.port, msg)), DEBUG_MODE)
             sys.exit()
         else:
-            print 'NS is up ([q] to exit)'
+            logging('NS is up ([q] to exit)', DEBUG_MODE)
             self.ns_socket.listen(MAX_CONNECTIONS_NUMBER)
             self.connections.append(self.ns_socket)
 
@@ -433,25 +707,21 @@ class NameServer(threading.Thread):
             try:
                 ready_to_read, ready_to_write, in_error = select.select(self.connections, [], [])
             except socket.error as msg:
-                print msg
+                logging(msg, DEBUG_MODE)
                 continue
-
-            thr_list = []
 
             for sock in ready_to_read:
                 if sock == self.ns_socket:
                     try:
                         client_socket, client_address = self.ns_socket.accept()
-                        print "New connection: ", client_socket, client_address
+                        logging(("New connection: ", client_socket, client_address), DEBUG_MODE)
                     except socket.error as msg:
-                        print msg
+                        logging(msg, DEBUG_MODE)
                         break
                     else:
                         self.connections.append(client_socket)
                 elif sock != sys.stdin:
-                    thr_list.append(threading.Thread(target=self._receive, args=(sock,)))
-                    thr_list[-1].start()
-                    # self._receive(sock)
+                    self._receive(sock)
                 else:
                     command = sys.stdin.readline()
                     sys.stdout.flush()
@@ -459,17 +729,19 @@ class NameServer(threading.Thread):
                     if command == 'q':
                         print "Bye bye"
                         self.stop()
-
-            for item in thr_list:
-                item.join()
+                    elif command == 's':
+                        logging(self.connections)
 
     def _receive(self, sock):
-        # TODO when the header is wrong - clear the buffer and send error response
-        start, package_id = read_header(sock, 'NameServer')
+        start, package_id = read_header(sock, 'NamingServer')
 
-        if package_id == 1:  # handshake
+        if not (start and package_id):
+            self.close_connection(sock)
+            return
+
+        if package_id == HANDSHAKE:
             self.handshake_storage_request(sock)
-        elif package_id == 4:  # storage to ns - check client-file permissions
+        elif package_id == STORAGE_CLIENT_PERMISSION:  # storage to ns - check client-file permissions
             self.client_permission_request(sock)
         elif package_id == ERROR_MSG:  # errors
             self.error_received(sock)
@@ -487,8 +759,6 @@ class NameServer(threading.Thread):
             self.rename_request(sock)
         elif package_id == CLIENT_FILE_SAVE_RESULT:  # storage to ns - file save result, draft
             self.file_save_result_request(sock)
-        elif package_id == STORAGE_GET_DELETE_RESPONSE:  # storage to ns - file delete result
-            self.delete_response_from_storage(sock)
         elif package_id == 28:  # storage to ns - update file result
             pass
         elif package_id == CLIENT_KEEP_ALIVE:  # client to ns - keep alive
@@ -499,15 +769,15 @@ class NameServer(threading.Thread):
             self.node_failed_request(sock)
         else:
             print "Wrong command received"
-            send_error(sock, WRONG_DATA)
+            self.send_error(sock, WRONG_DATA)
 
     def handshake_storage_request(self, sock):
         """
         1  | node_token[128] ip[4] port[2]  | handshake
         """
         # TODO public/private key use
-        conn, cur, node, token = self.check_by_token(sock, Node.table_name)
-
+        node, token = self.check_by_token(sock, Node.table_name)
+        print 'handshake', sock
         if token is False:
             return
 
@@ -528,15 +798,16 @@ class NameServer(threading.Thread):
             self.send_handshake_response(sock, token, RESPONSE_FAILURE)
             return
 
-        if node is False:
-            Node.add_node(conn, cur, token, str(ip), port)
+        if not node:
+            nodes = Node.find_many()
+            Node.add(token, str(ip), port, len(nodes) % 3)
         else:
             params = {
                 'ip': str(ip),
                 'port': port,
                 'alive': 1
             }
-            Node.update_node(conn, cur, token, params)
+            Node.update(params, {Node.TOKEN: token})
 
         self.authorized_nodes.append(sock)
         self.send_handshake_response(sock, token, RESPONSE_OK)
@@ -545,35 +816,43 @@ class NameServer(threading.Thread):
         """
         4  | client_token[128] filename[64] | storage to ns - check client-file permissions
         """
-        # TODO only updated are permitted
-
         if not Node.check_node(sock, self.authorized_nodes):
             return
 
-        client_token = self.string_decoding(sock, 128, 128)
+        client_token = string_decoding(sock, 128, 128)
 
         if client_token is False:
-            send_error(sock, WRONG_DATA)
-            print sock, ERROR_TEXT[WRONG_DATA], 'client token'
+            self.send_error(sock, WRONG_DATA)
+            logging((sock, ERROR_TEXT[WRONG_DATA], 'client token'), DEBUG_MODE)
             return
 
-        filename = self.string_decoding(sock, FILENAME_SIZE, FILENAME_SIZE)
+        filename = string_decoding(sock, FILENAME_SIZE, FILENAME_SIZE)
         if filename is False:
-            send_error(sock, WRONG_DATA)
-            print sock, ERROR_TEXT[WRONG_DATA], 'filename'
+            self.send_error(sock, WRONG_DATA)
+            logging((sock, ERROR_TEXT[WRONG_DATA], 'filename'), DEBUG_MODE)
+            return
 
-        conn, cur = connect_to_db()
-        user = User.find_by_token(cur, client_token)
+        user = User.find_one({User.TOKEN: client_token})
 
         if user:
-            entity_component = EntityComponent.find_entity_component(cur, filename)
-            if entity_component and Entity.find_entity(cur, entity_component['entity_id'], user['id'], True):
+            entity_component = EntityComponent.find_one({
+                EntityComponent.TOKEN: filename,
+                EntityComponent.STATUS: {
+                    '<>': STATUS_DELETED
+                }
+            })
+
+            if entity_component and Entity.find_one(
+                    {Entity.USER_ID: user[User.ID], EntityComponent.ID: entity_component[EntityComponent.ENTITY_ID]},
+                    [Entity.ID]
+            ):
+
                 self.send_client_permission_response(sock, client_token, filename, True)
-                print sock, client_token, filename, 'permission granted'
+                logging((sock, client_token, filename, 'permission granted'), DEBUG_MODE)
                 return
 
         self.send_client_permission_response(sock, client_token, filename, False)
-        print sock, client_token, filename, 'client', ERROR_TEXT[PERMISSION_DENIED]
+        logging((sock, client_token, filename, 'client', ERROR_TEXT[PERMISSION_DENIED]), DEBUG_MODE)
 
     def error_received(self, sock):
         """
@@ -583,87 +862,121 @@ class NameServer(threading.Thread):
         try:
             error_code, = struct.unpack('<B', error)
         except struct.error as msg:
-            print sock, msg
+            logging((sock, msg), DEBUG_MODE)
         else:
             if error_code in ERROR_TEXT:
-                print 'The error was received: ' + ERROR_TEXT[error_code]
+                logging(('The error was received: ' + ERROR_TEXT[error_code]))
             else:
-                print 'Some unfamiliar error was received. Code ' + str(error_code)
+                logging(('Some unfamiliar error was received. Code ' + str(error_code)))
 
     def rename_request(self, sock):
         """
         19 | token[128] size[2] srcfilepath size[2] dstfilepath | client to ns - rename file request
         """
-
-        conn, cur, user, token = self.check_by_token(sock, User.table_name)
+        # TODO update dir name
+        user, token = self.check_by_token(sock, User.table_name)
 
         if user is False:
-            send_error(sock, OLD_TOKEN)
+            self.send_error(sock, OLD_TOKEN)
             print sock, ERROR_TEXT[OLD_TOKEN]
             return
 
         srcfilepath = self.read_data(sock, 2)
         dstfilepath = self.read_data(sock, 2)
 
-        entity = Entity.find_entity_by_userid_filepath(cur, user['id'], srcfilepath)
+        entities = Entity.find_many(
+            {
+                Entity.USER_ID: user[User.ID],
+                Entity.FILEPATH:
+                    {' LIKE ': srcfilepath + '%'} if srcfilepath[-1] == '/' else {'=': srcfilepath},
+                Entity.STATUS:
+                    {
+                        '<>': STATUS_UPDATING,
+                    }
+            },
+            [Entity.ID, Entity.STATUS, Entity.FILEPATH, Entity.CREATED, Entity.MODIFIED, Entity.ACCESSED, Entity.FILESIZE]
+         )
 
-        if not entity:
-            print sock, user['id'], 'file not found'
+        if not entities:
+            logging((sock, user[User.ID], 'file not found'), DEBUG_MODE)
             self.rename_response(sock, srcfilepath, dstfilepath, False)
             return
 
-        Entity.update_entity_name(conn, cur, entity['id'], dstfilepath)
-        print sock, user['id'], entity['id'], 'renamed'
+        for entity in entities:
+
+            newfilepath = string.replace(entity[Entity.FILEPATH], srcfilepath, dstfilepath, 1)
+
+            Entity.update(
+                {Entity.FILEPATH: newfilepath},
+                {Entity.ID: entity[Entity.ID]}
+            )
+
+            logging((sock, entity[Entity.FILEPATH], newfilepath, user[User.ID], entity[Entity.ID], 'renamed'), DEBUG_MODE)
         self.rename_response(sock, srcfilepath, dstfilepath, True)
 
     def auth_client(self, sock):
         """
         id: 7  | package structure: size[1] login size[1] pass | client to ns - auth
         """
-        # TODO check login and password for correctness
-        # TODO user several tokens
         data = sock.recv(1)
         try:
             login_length,  = struct.unpack('<B', data)
         except struct.error as msg:
-            print msg
+            logging(msg, DEBUG_MODE)
             return
 
-        login = self.string_decoding(sock, login_length, login_length)
+        login = string_decoding(sock, login_length, login_length)
         if login is False:
+            send_error(sock, WRONG_DATA)
+            logging('wasnt able to read login', DEBUG_MODE)
+
             return
 
         data = sock.recv(1)
         try:
             pass_length,  = struct.unpack('<B', data)
         except struct.error as msg:
-            print msg
+            logging(msg, DEBUG_MODE)
             return
 
-        passwd = self.string_decoding(sock, pass_length, pass_length)
+        passwd = string_decoding(sock, pass_length, pass_length)
 
         if passwd is False:
+            send_error(sock, WRONG_DATA)
+            logging('wasnt able to read password', DEBUG_MODE)
             return
 
-        conn, cur = connect_to_db()
-        user = User.find_by_login(cur, login)
+        user = User.find_one({User.LOGIN: login})
 
         if user is None:
+            nodes = Node.find_many({Node.ALIVE: 1, Node.NODE_TYPE: NODE_TYPE_MAIN})
+            free_place = sum([node[Node.FREE_MEMORY] for node in nodes if node[Node.FREE_MEMORY]])
+
+            if free_place < USER_SPACE:
+                logging("not enough place on nodes, auth", DEBUG_MODE)
+                send_error(sock, NOT_ENOUGH_PLACE)
+                return
+
+            if login_length < 3 or pass_length < 6 or re.search("[^a-zA-Z0-9]+", login + passwd):
+                logging("user entered inappropriate login/password", DEBUG_MODE)
+                send_error(sock, WRONG_DATA)
+                return
+
             token = binascii.b2a_hex(os.urandom(FILENAME_SIZE))
-            User.add_user(conn, cur, token, login, passwd)
+            User.add_user(token, login, passwd)
         else:
             if not User.check_passwd(passwd, user):
-                print "User", user['id'], ERROR_TEXT[WRONG_PASSWORD]
+                logging(("User", user[User.ID], ERROR_TEXT[WRONG_PASSWORD]), DEBUG_MODE)
                 send_error(sock, WRONG_PASSWORD)
                 return
 
             if User.check_token_time(user):
-                print "User", user['id'], ERROR_TEXT[ALREADY_ACTIVE_ACCOUNT]
+                logging(("User", user[User.ID], ERROR_TEXT[ALREADY_ACTIVE_ACCOUNT]), DEBUG_MODE)
                 send_error(sock, ALREADY_ACTIVE_ACCOUNT)
                 return
 
             token = binascii.b2a_hex(os.urandom(FILENAME_SIZE))
-            User.update_user_token(conn, cur, user['id'], token)
+            User.update({User.LAST_LOGIN_TIME: time.time(), User.TOKEN: token}, {User.ID: user[User.ID]})
 
         self.send_token(sock, token)
 
@@ -672,54 +985,57 @@ class NameServer(threading.Thread):
         37 | token[128]  | client to ns - client logout
         """
 
-        token = self.string_decoding(sock, 128, 128)
+        token = string_decoding(sock, 128, 128)
 
         if token is False:
-            send_error(sock, WRONG_DATA)
-            print sock, ERROR_TEXT[WRONG_DATA]
+            self.send_error(sock, WRONG_DATA)
+            logging((sock, ERROR_TEXT[WRONG_DATA]), DEBUG_MODE)
             return
 
-        conn, cur = connect_to_db()
-        user = User.find_by_token(cur, token)
+        user = User.find_one({User.TOKEN: token})
 
         if not user:
-            send_error(sock, NOT_FOUND)
-            print sock, ERROR_TEXT[NOT_FOUND]
+            self.send_error(sock, NOT_FOUND)
+            logging((sock, ERROR_TEXT[NOT_FOUND]), DEBUG_MODE)
             return
 
-        User.update_user_time(conn, cur, user['id'], time.time() - 1000)
-        print sock, user['id'], 'user logged out'
+        User.update(
+            {User.LAST_LOGIN_TIME: time.time() - 1000},
+            {User.ID: user[User.ID]}
+        )
+
+        logging((sock, user['id'], 'user logged out'), DEBUG_MODE)
 
     def tree_request(self, sock):
         """
         9  | token[128] | client to ns - request the tree
         """
 
-        conn, cur, user, _ = self.check_by_token(sock, User.table_name)
+        user, _ = self.check_by_token(sock, User.table_name)
 
         if user is False:
             return
 
-        self.send_tree(cur, sock, user)
+        self.send_tree(sock, user)
 
     def get_file_request(self, sock):
         """
         13 | token[128] size[2] filepath | client to ns - get file request
         """
-        conn, cur, user, _ = self.check_by_token(sock, User.table_name)
+        user, _ = self.check_by_token(sock, User.table_name)
 
         if user is False:
             return
 
         filepath = self.read_data(sock, 2)
 
-        self.send_file_info(sock, cur, user['id'], filepath)
+        self.send_file_info(sock, user['id'], filepath)
 
     def upload_request(self, sock):
         """
         15 | token[128] size[2] filepath datasize[2] metadata | client to ns - upload file request
         """
-        conn, cur, user, _ = self.check_by_token(sock, User.table_name)
+        user, _ = self.check_by_token(sock, User.table_name)
 
         if user is False:
             return
@@ -733,10 +1049,9 @@ class NameServer(threading.Thread):
     def node_failed_request(self, sock):
         """
         38 | token[128] total[1] number[1] datasize[2] data | client to ns - node failed request
-        flag - continue, offset
         """
 
-        conn, cur, user, token = self.check_by_token(sock, User.table_name)
+        user, token = self.check_by_token(sock, User.table_name)
 
         if user is False:
             return
@@ -745,12 +1060,16 @@ class NameServer(threading.Thread):
         try:
             total, number, datasize = struct.unpack('<BBh', data)
         except struct.error as msg:
-            print sock, msg
+            logging((sock, msg), DEBUG_MODE)
             send_error(sock, WRONG_DATA)
             return
 
         data_block = DATA_SIZE if DATA_SIZE < datasize else datasize
-        data = self.string_decoding(sock, datasize, data_block)
+        data = string_decoding(sock, datasize, data_block)
+
+        if data is False:
+            self.close_connection(sock)
+            return
 
         if sock not in self.failed_node_info.keys():
             self.failed_node_info[sock] = {
@@ -762,164 +1081,193 @@ class NameServer(threading.Thread):
         self.failed_node_info[sock]['data'][number] = data
 
         if len(self.failed_node_info['data']) == total:
-            self.file_partitioning_update(sock, user, conn, cur)
+            self.file_partitioning_update(sock, user)
 
     def file_save_result_request(self, sock):
         """
         22 | filename[64] T/F[1]  | storage to ns - file save result
         """
-        # TODO save information about packet number, where the file uploading stopped
-
-        filename, result = self.parse_storage_result_response(sock)
+        filename, result = parse_storage_result_response(sock)
 
         if result == 1:
-            print filename
-            conn, cur = connect_to_db()
-            entity_component = EntityComponent.find_entity_component(cur, filename)
+            logging(filename, DEBUG_MODE)
+            entity_component = EntityComponent.find_one({
+                EntityComponent.TOKEN: filename,
+                EntityComponent.STATUS: {
+                    '<>': STATUS_DELETED
+                }
+            })
 
             if entity_component:
-                entity = Entity.find_entity_by_id(cur, entity_component['entity_id'])
-                if entity:
-                    EntityComponent.update_component_status(conn, cur, STATUS_SAVED, entity_component['id'])
-                    print 'Entity component was saved', entity_component['id']
+                entity = Entity.find_one({Entity.ID: entity_component[EntityComponent.ENTITY_ID]})
 
-                    updating_components = EntityComponent.find_entity_components(cur, entity['id'], STATUS_UPDATING)
+                if entity:
+                    EntityComponent.update(
+                        {EntityComponent.STATUS: STATUS_REPLICATING},
+                        {EntityComponent.ID: entity_component[EntityComponent.ID]}
+                    )
+
+                    logging(('Entity component was saved', entity_component[EntityComponent.ID]), DEBUG_MODE)
+
+                    updating_components = EntityComponent.find_many({
+                        EntityComponent.ENTITY_ID: entity[Entity.ID],
+                        EntityComponent.STATUS: {
+                            "=": STATUS_UPDATING,
+                            "<>": STATUS_DELETED
+                        }
+                    })
 
                     if len(updating_components) == 0:
-                        EntityComponent.delete_old_components_by_entity_id(conn, cur, entity['id'])
-                        entity_data = {
-                            'modified': entity['modified_new'] if entity['modified_new'] else entity['modified'],
-                            'modified_new': None,
-                            'status': STATUS_SAVED,
-                            'filesize': entity['filesize_new'] if entity['filesize_new'] else entity['filesize'],
-                            'filesize_new': None
-                        }
-                        Entity.update_entity(conn, cur, entity['id'], entity_data)
-                        print 'Entity was saved', entity['id']
+                        EntityComponent.update(
+                            {EntityComponent.STATUS: STATUS_DELETED},
+                            {EntityComponent.STATUS: STATUS_OLD, EntityComponent.ENTITY_ID: entity[Entity.ID]}
+                        )
 
-                    self.authorized_nodes.remove(sock)
+                        entity_data = {
+                            Entity.MODIFIED: entity[Entity.MODIFIED_NEW] if entity[Entity.MODIFIED_NEW] else entity[Entity.MODIFIED],
+                            Entity.MODIFIED_NEW: None,
+                            Entity.STATUS: STATUS_SAVED,
+                            Entity.FILESIZE: entity[Entity.FILESIZE_NEW] if entity[Entity.FILESIZE_NEW] else entity[Entity.FILESIZE],
+                            Entity.FILESIZE_NEW: None
+                        }
+
+                        Entity.update(
+                            entity_data,
+                            {Entity.ID: entity[Entity.ID]}
+                        )
+                        logging(('Entity was saved', entity[Entity.ID]), DEBUG_MODE)
+
+                    self.close_connection(sock)
                     return
 
             send_error(sock, WRONG_DATA)
-            print sock, filename, ERROR_TEXT[WRONG_DATA]
-
-    def delete_response_from_storage(self, sock):
-        """
-        24 | filename[64] T/F[1]  | storage to ns - file delete result
-        """
-        filename, result = self.parse_storage_result_response(sock)
-
-        if result == 1:
-            conn, cur = connect_to_db()
-            entity_component = EntityComponent.find_entity_component(cur, filename)
-
-            if entity_component:
-                EntityComponent.delete_component(conn, cur, entity_component['id'])
-
-                self.close_connection(sock)
-                return
-
-        send_error(sock, WRONG_DATA)
-        print sock, filename, ERROR_TEXT[WRONG_DATA]
-
-    def parse_storage_result_response(self, sock):
-        filename = self.string_decoding(sock, FILENAME_SIZE, FILENAME_SIZE)
-
-        if filename is False:
-            send_error(sock, WRONG_DATA)
-            print sock, ERROR_TEXT[WRONG_DATA], 'filename'
-            return False, False
-
-        data = sock.recv(1)
-        try:
-            result, = struct.unpack('<B', data)
-        except struct.error as msg:
-            send_error(sock, WRONG_DATA)
-            print sock, msg, ERROR_TEXT[WRONG_DATA]
-            return False, False
-
-        return filename, result
+            logging((sock, filename, ERROR_TEXT[WRONG_DATA]), DEBUG_MODE)
 
     def keep_alive_request(self, sock):
         """
         34 | token[128] | client to ns - keep alive
         """
 
-        conn, cur, user, _ = self.check_by_token(sock, User.table_name)
+        user, _ = self.check_by_token(sock, User.table_name)
         if user is False:
             return
         else:
-            User.update_user_time(conn, cur, user['id'])
+            User.update({User.LAST_LOGIN_TIME: time.time()}, {User.ID: user[User.ID]})
 
     def delete_request(self, sock):
         """
         17 | token[128] size[2] filepath  | client to ns - file delete request
         """
-
-        conn, cur, user, _ = self.check_by_token(sock, User.table_name)
+        user, _ = self.check_by_token(sock, User.table_name)
 
         if user is False:
             return
 
         filepath = self.read_data(sock, 2)
-        entity = Entity.find_entity_by_userid_filepath(cur, user['id'], filepath, True)
 
-        if not entity:
-            print "User", user['id'], "tried to delete file", filepath, ERROR_TEXT[NOT_FOUND]
+        entities = Entity.find_many(
+            {Entity.USER_ID: user['id'], Entity.FILEPATH: {' LIKE ': filepath + '%'}},
+            [
+                Entity.ID, Entity.STATUS, Entity.FILEPATH, Entity.CREATED,
+                Entity.MODIFIED, Entity.ACCESSED, Entity.FILESIZE
+            ]
+        )
+
+        if not entities:
+            logging(("User", user[User.ID], "tried to delete file", filepath, ERROR_TEXT[NOT_FOUND]), DEBUG_MODE)
             send_error(sock, NOT_FOUND)
-        elif entity['status'] == STATUS_UPDATING:
-            print "User", user['id'], "tried to delete file", filepath, ERROR_TEXT[FILE_CURRENTLY_UPDATING]
-            send_error(sock, FILE_CURRENTLY_UPDATING)
         else:
-            self.send_delete_from_storage(conn, cur, entity['id'])
-            print filepath, user['id'], sock, 'file was removed'
-            Entity.delete_entity(conn, cur, entity['id'])
-            self.send_delete_response(sock, filepath, True)
+            for entity in entities:
+                if entity[Entity.STATUS] == STATUS_UPDATING:
+                    logging(
+                            ("User", user['id'], "tried to delete file", filepath, ERROR_TEXT[FILE_CURRENTLY_UPDATING]),
+                            DEBUG_MODE
+                         )
+                    send_error(sock, FILE_CURRENTLY_UPDATING)
+                else:
+                    EntityComponent.update(
+                        {EntityComponent.STATUS: STATUS_DELETED, EntityComponent.ENTITY_ID: 0},
+                        {EntityComponent.ENTITY_ID: entity[Entity.ID], EntityComponent.STATUS: {'<>': STATUS_DELETED}}
+                    )
+                    logging((filepath, user['id'], sock, 'file was removed (and subfiles if exist)'), DEBUG_MODE)
+
+                    User.update({User.MEMORY: user[User.MEMORY] - entity[Entity.FILESIZE]}, {User.ID: user[User.ID]})
+                    Entity.delete({Entity.ID: entity[Entity.ID]})
+                    self.send_delete_response(sock, filepath, True)
 
     def send_token(self, sock, token):
         """
         8  | token[128]  | ns to client - auth
         """
-        print(token)
-        send(sock, CLIENT_SEND_AUTH, token.encode())
+        result = send(sock, CLIENT_SEND_AUTH, token.encode())
+        if not result:
+            self.close_connection(sock)
 
-    def send_tree(self, cur, sock, user):
+    def send_tree(self, sock, user):
         """
-            10 | total[1] number[1] datasize[2] data | ns to client - send the tree
+        10 | total[1] number[1] datasize[2] data | ns to client - send the tree
         """
-        tree = Entity.find_entities(cur, user['id'])
+        tree = Entity.find_many(
+            {Entity.USER_ID: user[User.ID], Entity.STATUS: STATUS_UPDATING},
+            [Entity.FILEPATH, Entity.CREATED, Entity.MODIFIED, Entity.ACCESSED, Entity.FILESIZE]
+        )
+
+        tree.insert({
+            'total': USER_SPACE,
+            'free': USER_SPACE - user[User.MEMORY]
+        })
+
         json_tree = json.dumps(tree)
 
         self.pack_and_send_data(sock, CLIENT_SEND_TREE, json_tree)
 
-    def send_file_info(self, sock, cur, userid, filepath):
+    def send_file_info(self, sock, userid, filepath):
         """
         14 | total[1] number[1] datasize[2] data | ns to client - send file's chunks locations
         """
-        entity = Entity.find_entity_by_userid_filepath(cur, userid, filepath)
-        print userid, filepath
+        entity = Entity.find_one(
+            {Entity.USER_ID: userid, Entity.FILEPATH: filepath, Entity.STATUS: STATUS_UPDATING},
+            [Entity.ID, Entity.STATUS, Entity.FILEPATH, Entity.CREATED, Entity.MODIFIED, Entity.ACCESSED, Entity.FILESIZE]
+        )
+
+        logging((userid, filepath), DEBUG_MODE)
         if entity is None:
-            print sock, ERROR_TEXT[NOT_FOUND], "file info request"
+            logging((sock, ERROR_TEXT[NOT_FOUND], "file info request"), DEBUG_MODE)
             data = '{}'
             self.pack_and_send_data(sock, CLIENT_SEND_FILE_INFO, data)
             return
 
-        entity_components = EntityComponent.find_entity_components(cur, entity['id'])
+        entity_components = EntityComponent.find_many({
+            EntityComponent.ENTITY_ID: entity[Entity.ID],
+            EntityComponent.STATUS: {
+                "<>": STATUS_DELETED,
+                "<>": STATUS_UPDATING
+            }
+        }, [], " ORDER BY " + EntityComponent.FILE_ORDER + " ASC")
+
         entity_list = []
+        offset = 0
+
         for entity_component in entity_components:
-            tmp_node = Node.find_by_id(cur, entity_component['node_id'])
+            tmp_node = Node.find_one({Node.ID: entity_component[EntityComponent.NODE_ID]})
+
             if tmp_node:
                 entity_list.append({
-                    'port': tmp_node['port'],
-                    'ip': tmp_node['ip'],
-                    'filename': entity_component['token'],
-                    'replica': entity_component['replica_numb'],
-                    'filesize': entity_component['chunk_size'],
-                    'file_order': entity_component['file_order']
+                    'port': tmp_node[Node.PORT],
+                    'ip': tmp_node[Node.IP],
+                    'filename': entity_component[EntityComponent.TOKEN],
+                    'replica': entity_component[EntityComponent.REPLICA_NUMB],
+                    'filesize': entity_component[EntityComponent.CHUNK_SIZE],
+                    'file_order': entity_component[EntityComponent.FILE_ORDER],
+                    'continue': 0,
+                    'offset': offset
                 })
 
-        entity.pop('id', None)
-        entity.pop('status', None)
+                if tmp_node[Node.NODE_TYPE] == NODE_TYPE_MAIN:
+                    offset += entity_component[EntityComponent.CHUNK_SIZE]
+
+        entity.pop(Entity.ID, None)
+        entity.pop(Entity.STATUS, None)
         entity['total'] = len(entity_list)
         entity['components'] = entity_list
 
@@ -931,7 +1279,9 @@ class NameServer(threading.Thread):
         31 | node_token[128] T/F[1] | ns to storage - handshake response
         """
         data = token.encode() + struct.pack('<B', response)
-        send(sock, STORAGE_HANDSHAKE_RESPONSE, data)
+        result = send(sock, STORAGE_HANDSHAKE_RESPONSE, data)
+        if not result:
+            self.close_connection(sock)
 
     def send_client_permission_response(self, sock, client_token, filename, response):
         """
@@ -939,35 +1289,10 @@ class NameServer(threading.Thread):
         """
 
         data = client_token.encode() + filename.encode() + struct.pack('<B', 1 if response else 0)
-        send(sock, STORAGE_SEND_CLIENT_PERMISSION_RESPONSE, data)
+        result = send(sock, STORAGE_SEND_CLIENT_PERMISSION_RESPONSE, data)
 
-    def send_delete_from_storage(self, conn, cur, entity_id):
-        """
-        23 | token[128] filename[64]  | ns to storage - delete file
-        """
-
-        components = EntityComponent.find_entity_components(cur, entity_id)
-        for component in components:
-            node = Node.find_by_id(cur, component['node_id'])
-            if not node:
-                EntityComponent.delete_component(conn, cur, component['id'])
-                continue
-
-            out_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                out_sock.connect((node['ip'], node['port']))
-            except socket.error as msg:
-                print 'delete_from storage request', out_sock, msg
-                continue
-
-            self.authorized_nodes.append(out_sock)
-            self.connections.append(out_sock)
-
-            data = node['token'].encode() + component['token'].encode()
-            print 'send delete component', out_sock, entity_id
-            send(out_sock, STORAGE_SEND_DELETE, data)
-
-        EntityComponent.update_components_status(conn, cur, STATUS_DELETED, entity_id)
+        if not result:
+            self.close_connection(sock)
 
     def send_delete_response(self, sock, filepath, success):
         """
@@ -983,36 +1308,40 @@ class NameServer(threading.Thread):
         """
 
         data = struct.pack('<h', len(srcfilepath)) + srcfilepath.encode() \
-               + struct.pack('<h', len(dsfilepath)) + dsfilepath.encode() + struct.pack('<B', result)
-        send(sock, CLIENT_RENAME_RESPONSE, data)
+            + struct.pack('<h', len(dsfilepath)) + dsfilepath.encode() + struct.pack('<B', result)
+        result = send(sock, CLIENT_RENAME_RESPONSE, data)
+        if not result:
+            self.close_connection(sock)
 
     def check_by_token(self, sock, class_name):
-        token = self.string_decoding(sock, 128, 128)
+        token = string_decoding(sock, 128, 128)
 
         if token:
-            conn, cur = connect_to_db()
             if class_name == User.table_name:
-                obj = User.find_by_token(cur, token)
+                obj = User.find_one({User.TOKEN: token})
+
             elif class_name == Node.table_name:
-                obj = Node.find_by_token(cur, token)
+                obj = Node.find_one({Node.TOKEN: token})
             else:
                 raise Exception('class name ' + class_name + ' does not exist')
 
-            if obj is None:
+            if obj is None and obj == User.table_name:
                 send_error(sock, NOT_FOUND)
-                return conn, cur, False, token
+                return False, token
             else:
                 if class_name == User.table_name and not User.check_token_time(obj):
-                    print 'User', obj['id'], 'with too old token'
+                    logging(('User', obj['id'], 'with too old token'), DEBUG_MODE)
                     send_error(sock, OLD_TOKEN)
-                    return False, False, False, False
+                    return False, False
 
-            return conn, cur, obj, token
-        return False, False, False, False
+            return obj, token
+
+        return False, False
 
     def read_data(self, sock, b_number):
         full_size, block_size = self.stringsize_retrieve(sock, b_number)
-        return self.string_decoding(sock, full_size, block_size)
+        result = string_decoding(sock, full_size, block_size)
+        return result
 
     def stringsize_retrieve(self, sock, total_bytes):
         data = sock.recv(total_bytes)
@@ -1024,8 +1353,8 @@ class NameServer(threading.Thread):
 
             path_size, = struct.unpack('<'+unpack_b, data)
         except struct.error as msg:
-            send_error(sock, WRONG_DATA)
-            print msg, sock
+            self.send_error(sock, WRONG_DATA)
+            logging((msg, sock), DEBUG_MODE)
             return
 
         data_block = DATA_SIZE if DATA_SIZE < path_size else path_size
@@ -1045,149 +1374,148 @@ class NameServer(threading.Thread):
                 block = json_tree[i * DATA_SIZE:]
                 last_package_size = struct.pack('<h', len(block))
                 data += last_package_size + block.encode()
-            send(sock, msg_code, data)
-
-    def file_download(self, sock):
-        data = sock.recv(2)
-        total = struct.unpack('<h', data)
+            result = send(sock, msg_code, data)
+            if not result:
+                self.close_connection(sock)
 
     def separate_on_chunks(self, free_places, filesize):
-        conn, cur = connect_to_db()
-        nodes = Node.find_nodes(cur)
+
 
         # TODO improve algorithm so that free space for each node would become more equal
-        # totally_free = sum([self.memory_request_nodes[i]['free'] for i in self.memory_request_nodes])
+        # !!!!! WARNING !!!!! Not clever file splitter
+
         totally_free = sum(free_places)
+        if totally_free < filesize:
+            return False
+
         rel_places = [int(math.floor(filesize * item / float(totally_free))) for item in free_places]
 
         diff = filesize - sum(rel_places)
         i = 0
         while diff > 0 and i < len(free_places):
-            if rel_places[i] < free_places[i]:
+            if rel_places[i] < free_places[i] and not rel_places[i] is 0:
                 rel_places[i] += 1
                 diff -= 1
             i += 1
 
         return rel_places
 
-    def string_decoding(self, sock, full_size, block_size):
-        data = ""
-
-        while len(data) < full_size:
-            tmp = sock.recv(block_size)
-            if tmp == "":
-                print sock, 'Wrong data was received'
-                send_error(sock, WRONG_DATA)
-                return False
-            data += tmp
-
-        try:
-            res = data.decode()
-        except UnicodeDecodeError as msg:
-            print sock, msg
-            send_error(sock, WRONG_DATA)
-            return False
-
-        return res
-
     def send_upload_file_info(self, sock, filepath, metadata_json, user):
         """
         16 | total[1] number[1] datasize[2] data | ns to client - file upload information
         """
-        conn, cur = connect_to_db()
-
         try:
             metadata = json.loads(metadata_json)
         except ValueError as msg:
-            print user, msg
+            logging((user, msg), DEBUG_MODE)
             send_error(sock, WRONG_DATA)
             return
 
-        print metadata
+        logging(metadata, DEBUG_MODE)
 
         if not type(metadata) is dict:
-            print user, "the message that was sent is not dictionary"
+            logging((user, "the message that was sent is not dictionary"), DEBUG_MODE)
             send_error(sock, WRONG_DATA)
             return
 
         if not all(item in metadata.keys()for item in Entity.keys):
-            print "Not all parameters for the entity were received", sock
+            logging(("Not all parameters for the entity were received", sock), DEBUG_MODE)
             send_error(sock, WRONG_DATA)
             return
 
-        entity_file = Entity.find_entity_by_userid_filepath(cur, user["id"], filepath, True)
+        entity_file = Entity.find_one(
+            {Entity.USER_ID: user['id'], Entity.FILEPATH: filepath},
+            [Entity.ID, Entity.STATUS, Entity.FILEPATH, Entity.CREATED, Entity.MODIFIED, Entity.ACCESSED, Entity.FILESIZE]
+        )
+
+        busy_memory = user[User.MEMORY]
+        if entity_file:
+            busy_memory = busy_memory - entity_file[Entity.FILESIZE] + metadata['filesize']
+
+        if busy_memory > USER_SPACE:
+            logging(("User dont have enough place available", user[User.ID], sock), DEBUG_MODE)
+            send_error(sock, NOT_ENOUGH_PLACE)
+            return
+
+        nodes = Node.find_many({Node.ALIVE: 1, Node.NODE_TYPE: NODE_TYPE_MAIN})
+        free_places = [node[Node.FREE_MEMORY] for node in nodes if node[Node.FREE_MEMORY]]
+        chunk_sizes = self.separate_on_chunks(free_places, metadata['filesize'])
+
+        if chunk_sizes is False:
+            send_error(sock, NOT_ENOUGH_PLACE)
+            logging(("No place on storages", sock), DEBUG_MODE)
+            return
 
         if not entity_file:
-            entity_id = Entity.create_entity(conn, cur, user["id"], filepath, metadata['filesize'], metadata['created'],
-                                             metadata['modified'], metadata['accessed'])
-        elif entity_file['status'] == STATUS_UPDATING:
-            print "User", user['id'], 'cannot update file', filepath + '. File is currently updating.'
+            entity_id = Entity.add(
+                user[User.ID], filepath, metadata['filesize'], metadata['created'],
+                metadata['modified'], metadata['accessed']
+            )
+
+            if metadata['filesize']:
+                user.update({User.MEMORY: busy_memory}, {User.ID: user[User.ID]})
+
+        elif entity_file[Entity.STATUS] == STATUS_UPDATING:
+            logging(("User", user['id'], 'cannot update file', filepath + '. File is currently updating.'), DEBUG_MODE)
             send_error(sock, FILE_CURRENTLY_UPDATING)
             return
         else:
-            entity_id = entity_file['id']
-            entity_data = {
-                'filesize': metadata['filesize'],
-                'accessed': metadata['accessed'],
-                'modified_new': metadata['modified'],
-                'status':  STATUS_UPDATING
-            }
-            Entity.update_entity(conn, cur, entity_id, entity_data)
+            entity_id = entity_file[Entity.ID]
 
-            EntityComponent.update_components_status(conn, cur, STATUS_OLD, entity_id)
+            Entity.update(
+                {
+                    Entity.FILESIZE: metadata['filesize'],
+                    Entity.ACCESSED: metadata['accessed'],
+                    Entity.MODIFIED_NEW: metadata['modified'],
+                    Entity.STATUS: STATUS_UPDATING
+                },
+                {Entity.ID: entity_id}
+            )
+            user.update({User.MEMORY: busy_memory}, {User.ID: user[User.ID]})
+
+            EntityComponent.update(
+                {EntityComponent.STATUS: STATUS_OLD},
+                {EntityComponent.ENTITY_ID: entity_id, EntityComponent.STATUS: {"<>": STATUS_DELETED}}
+            )
 
         metadata.pop('modified', None)
         metadata.pop('accessed', None)
         metadata.pop('created', None)
 
-        self.update_file(sock, conn, cur, entity_id, metadata)
+        self.update_file(sock, entity_id, metadata, chunk_sizes, nodes)
 
-    def update_file(self, sock, conn, cur, entity_id, metadata):
+    def update_file(self, sock, entity_id, metadata, chunk_sizes, nodes):
         metadata['components'] = []
         if metadata['filesize'] == 0:
-            self.send_delete_from_storage(conn, cur, entity_id)
-            print "0 bytes file uploaded, deleting entity components", sock, entity_id
+            logging(("0 bytes file uploaded, deleting entity components", sock, entity_id), DEBUG_MODE)
         else:
-            nodes = Node.find_nodes(cur)
-            mem_available = []
-            # tmp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            for node in nodes:
-                # tmp_socket.connect()
-                mem_available.append(2 ** 40)
-
-            free_size, nodes = mem_available, nodes
-
-            # if self.memory_info_received == 0:
-            #     for node in self.memory_request_nodes.keys():
-            #         if node in self.connections:
-            #             self.connections.remove(node)
-            #
-            #     self.memory_request_nodes = {}
-            #     print sock, ERROR_TEXT[NO_STORAGE_NODE_IS_AVAILABLE]
-            #     send_error(sock, NO_STORAGE_NODE_IS_AVAILABLE)
-            #
-            #     return
-
-            chunk_sizes = self.separate_on_chunks(free_size, metadata['filesize'])
             metadata.pop('filesize', None)
-
+            offset = 0
             for i in range(len(chunk_sizes)):
-                filename = EntityComponent.add_entity_component(conn, cur, entity_id, nodes[i]['id'], i + 1,
-                                                                1, STATUS_UPDATING, chunk_sizes[i])
+                filename = EntityComponent.add(
+                    entity_id, nodes[i][Node.ID], i + 1,
+                    NODE_TYPE_MAIN, STATUS_UPDATING, chunk_sizes[i]
+                )
 
                 metadata['components'].append({
                     'filename': filename,
                     'filesize': chunk_sizes[i],
-                    'ip': nodes[i]['ip'],
-                    'port': nodes[i]['port'],
+                    'ip': nodes[i][Node.IP],
+                    'port': nodes[i][Node.PORT],
                     'file_order': i + 1,
-                    'replica': i + 1,
+                    'replica': NODE_TYPE_MAIN,
+                    'continue': 0,
+                    'offset': offset
                 })
+
+                offset += chunk_sizes[i]
 
         json_tree = json.dumps(metadata)
         self.pack_and_send_data(sock, CLIENT_SEND_UPLOAD_RESULT, json_tree)
 
-    def file_partitioning_update(self, sock, user, conn, cur):
+    def file_partitioning_update(self, sock, user):
+        #         flag - continue, offset
+
         if sock not in self.failed_node_info.keys():
             print 'no such socket in failed nodes list', sock, self.failed_node_info
 
@@ -1201,89 +1529,130 @@ class NameServer(threading.Thread):
             file_data = json.loads(data)
         except ValueError as msg:
             print sock, msg, 'file partitioning update'
-            send_error(sock, WRONG_DATA)
             return
 
-        if not ('filepath' or 'data') in file_data:
+        if not ('filepath' or 'data' or 'node') in file_data:
             print sock, 'wrong data was sent (failed node request)'
-            send_error(sock, WRONG_DATA)
             return
 
-        entity = Entity.find_entity_by_userid_filepath(cur, user['id'], file_data['filepath'], True)
+        entity = Entity.find_one(
+            {Entity.USER_ID: user['id'], Entity.FILEPATH: file_data['filepath']},
+            [Entity.ID, Entity.STATUS, Entity.FILEPATH, Entity.CREATED, Entity.MODIFIED, Entity.ACCESSED, Entity.FILESIZE]
+        )
+
         if not entity:
             print sock, 'entity not found', file_data['filepath']
-            send_error(sock, NOT_FOUND)
             return
 
-        if entity['status'] == STATUS_UPDATING:
-            Entity.update_entity(conn, cur, entity['id'], {})
-            EntityComponent.update_components_status(conn, cur, STATUS_OLD, entity['id'])
-            self.update_file(sock, conn, cur, entity['id'], {'filesize': 0})
+        Node.update({Node.ALIVE: 0}, {Node.IP: file_data['node']['ip'], Node.PORT: file_data['node']['port']})
 
-        nodes = Node.find_nodes(cur)
-        components = EntityComponent.find_entity_components(cur, entity['id'])
+        nodes = Node.find_many({Node.ALIVE: 1, Node.NODE_TYPE: NODE_TYPE_MAIN})
 
-        # self.timer.cancel()
-        # ev = threading.Event()
-        # self.memory_info_update()
-        # ev.wait()
+        uploaded_components = EntityComponent.find_many({
+            EntityComponent.ENTITY_ID: entity['id'],
+            EntityComponent.STATUS: {
+                '<>': STATUS_DELETED,
+                '=': STATUS_SAVED
+            }
+        })
+
+        uploaded_ids = [item['node_id'] for item in uploaded_components]
+        free_memory = [item['free_memory'] for item in nodes if item['id'] not in uploaded_ids]
+
+        not_loaded_components = EntityComponent.find_many({
+            EntityComponent.ENTITY_ID: entity['id'],
+            EntityComponent.STATUS: {
+                '<>': STATUS_DELETED,
+                '=': STATUS_UPDATING
+            }
+        })
+
+        not_loaded_size = 0
+
+        for comp in not_loaded_components:
+            not_loaded_components += comp['chunk_size']
+
+        chunk_sizes = self.separate_on_chunks(free_memory, not_loaded_size)
+
+        if not chunk_sizes:
+            for comp in uploaded_components:
+                EntityComponent.update({EntityComponent.STATUS: STATUS_DELETED}, {EntityComponent.ID: comp['id']})
+
+            for comp in uploaded_components:
+                if comp['node_id']:
+                    not_loaded_size += comp['chunk_size']
+
+            free_memory = [item['free_memory'] for item in nodes]
+            chunk_sizes = self.separate_on_chunks(free_memory, not_loaded_size)
+
+            if not chunk_sizes:
+                self.send_error(sock, NOT_ENOUGH_PLACE)
+                print 'node failed, no place available'
+                return
+
+        # if entity['status'] == STATUS_SAVED or entity['filesize'] == 0 or len(file_data['data']) == 0:
+        #     Entity.update_entity(entity['id'], {'status': STATUS_UPDATING})
+        #     EntityComponent.update_components_status(STATUS_OLD, entity['id'])
+        #     self.update_file(sock, entity['id'], {'filesize': 0})
+
+
+
+
+
+
+
+
 
 class User:
     table_name = 'user'
+
+    ID = 'id'
+    LAST_LOGIN_TIME = 'last_login_time'
+    LOGIN = 'login'
+    TOKEN = 'token'
+    MEMORY = 'memory'
+    PASS_HASH = 'pass_hash'
 
     def __init__(self):
         pass
 
     @staticmethod
-    def create_table(cur):
-        cur.execute("CREATE TABLE IF NOT EXISTS " + User.table_name + " ("
-                    "id INTEGER PRIMARY KEY, "
-                    "last_login_time DOUBLE NOT NULL, "
-                    "login VARCHAR(20) NOT NULL, "
-                    "token VARCHAR(128), "
-                    "pass_hash VARCHAR(25) NOT NULL"
-                    ")")
+    def create_table():
+        command = "CREATE TABLE IF NOT EXISTS " + User.table_name + \
+                  " (" \
+                    + User.ID + " INTEGER PRIMARY KEY, " \
+                    + User.LAST_LOGIN_TIME + " DOUBLE NOT NULL, " \
+                    + User.LOGIN + " VARCHAR(20) NOT NULL, " \
+                    + User.TOKEN + " VARCHAR(128), " \
+                    + User.MEMORY + " REAL NOT NULL, " \
+                    + User.PASS_HASH + " VARCHAR(25) NOT NULL" \
+                  ")"
+
+        DBRequests.connect_to_db(command)
 
     @staticmethod
-    def find_by_login(cur, login):
-        cur.execute("SELECT * FROM " + User.table_name + " WHERE login=?", (login, ))
-        return cur.fetchone()
-
-    @staticmethod
-    def find_by_id(cur, user_id):
-        cur.execute("SELECT * FROM " + User.table_name + " WHERE id=?", (user_id,))
-        return cur.fetchone()
-
-    @staticmethod
-    def find_by_token(cur, token):
-        cur.execute("SELECT * FROM " + User.table_name + " WHERE token=?", (token,))
-        return cur.fetchone()
-
-    @staticmethod
-    def add_user(conn, cur, token, login, passwd):
-        # TODO check for successful execution
+    def add_user(token, login, passwd):
         passwd_hash = hashlib.sha512(passwd).hexdigest()
-        cur.execute("INSERT INTO " + User.table_name + "(id, login, pass_hash, last_login_time, token) VALUES (NULL, ?, ?, ?, ?)",
-                    (login, passwd_hash, time.time(), token))
-        conn.commit()
+        command = "INSERT INTO " + User.table_name + \
+                  "(id, login, pass_hash, last_login_time, token, memory) VALUES (NULL, ?, ?, ?, ?, 0)"
+        args = (login, passwd_hash, time.time(), token)
+        return DBRequests.connect_to_db(command, args, DB_QUERY_TYPE_INSERT)
 
     @staticmethod
-    def update_user_time(conn, cur, userid, new_time=False):
-        # TODO check for successful execution
-
-        cur.execute(
-            "UPDATE " + User.table_name + " SET last_login_time=? WHERE id=?",
-            ((new_time if new_time else time.time()), userid))
-
-        conn.commit()
+    def find_one(params={}, select_values=[]):
+        return DBRequests.find_one(User.table_name, params, select_values)
 
     @staticmethod
-    def update_user_token(conn, cur, userid, token):
-        # TODO check for successful execution
-        cur.execute(
-            "UPDATE " + User.table_name + " SET last_login_time=?, token=? WHERE id=?",
-            (time.time(), token, userid))
-        conn.commit()
+    def find_many(params={}, select_values=[]):
+        return DBRequests.find_many(User.table_name, params, select_values)
+
+    @staticmethod
+    def update(change_to, find_by={}):
+        DBRequests.update(User.table_name, change_to, find_by)
+
+    @staticmethod
+    def drop_table():
+        DBRequests.drop_table(User.table_name)
 
     @staticmethod
     def check_passwd(passwd, user):
@@ -1294,51 +1663,8 @@ class User:
         # TODO
         return time.time() - user['last_login_time'] < CLIENT_TIMEOUT
 
-    @staticmethod
-    def drop_table(cur):
-        cur.execute("DROP TABLE " + User.table_name)
-
-
-class UserToken:
-    table_name = 'user_token'
-
-    def __init__(self):
-        pass
-
-    @staticmethod
-    def create_table(cur):
-        cur.execute("CREATE TABLE IF NOT EXISTS " + UserToken.table_name + " ("
-                    "id INTEGER PRIMARY KEY, "
-                    "token VARCHAR(128), "
-                    "user_id INTEGER NOT NULL"
-                    ")")
-
-    @staticmethod
-    def find_by_token(cur, token):
-        cur.execute("SELECT * FROM " + User.table_name + " WHERE token=?", (token,))
-        return cur.fetchone()
-
-    @staticmethod
-    def add_token(conn, cur, token, userid):
-        # TODO check for successful execution
-        cur.execute("INSERT INTO " + UserToken.table_name + "(id, token, user_id) VALUES (NULL, ?, ?)",
-                    (token, userid))
-        conn.commit()
-
-    @staticmethod
-    def drop_table(cur):
-        cur.execute("DROP TABLE " + UserToken.table_name)
-
 
 class Entity:
-    # TODO handle the situation when file should be deleted, or fully updated
-    """
-    Statuses:
-    1: uploading
-    2: saved
-    3: old
-    """
-
     table_name = 'entity'
 
     def __init__(self):
@@ -1346,317 +1672,304 @@ class Entity:
 
     keys = ['filesize', 'created', 'modified', 'accessed']
 
-    @staticmethod
-    def create_table(cur):
-        cur.execute("CREATE TABLE IF NOT EXISTS " + Entity.table_name + " ("
-                    "id INTEGER PRIMARY KEY, "
-                    "filepath VARCHAR(65536) NOT NULL, "
-                    "userid INTEGER NOT NULL, "
-                    "created REAL NOT NULL, "
-                    "modified REAL NOT NULL, "
-                    "modified_new REAL, "
-                    "accessed REAL NOT NULL, "
-                    "filesize INTEGER NOT NULL, "
-                    "filesize_new INTEGER, "
-                    "status INTEGER NOT NULL "
-                    ")")
+    ID = 'id'
+    FILEPATH = 'filepath'
+    USER_ID = 'userid'
+    CREATED = 'created'
+    MODIFIED = 'modified'
+    MODIFIED_NEW = 'modified_new'
+    ACCESSED = 'accessed'
+    FILESIZE = 'filesize'
+    FILESIZE_NEW = 'filesize_new'
+    STATUS = 'status'
 
     @staticmethod
-    def drop_table(cur):
-        cur.execute("DROP TABLE " + Entity.table_name)
+    def create_table():
+        command = "CREATE TABLE IF NOT EXISTS " + Entity.table_name + " (" \
+                                                                      + Entity.ID + " INTEGER PRIMARY KEY, " \
+                                                                      + Entity.FILEPATH + " VARCHAR(65536) NOT NULL, " \
+                                                                      + Entity.USER_ID + " INTEGER NOT NULL, " \
+                                                                      + Entity.CREATED + " REAL NOT NULL, " \
+                                                                      + Entity.MODIFIED + " REAL NOT NULL, " \
+                                                                      + Entity.MODIFIED_NEW + " REAL, " \
+                                                                      + Entity.ACCESSED + " REAL NOT NULL, " \
+                                                                      + Entity.FILESIZE + " INTEGER NOT NULL, " \
+                                                                      + Entity.FILESIZE_NEW + " INTEGER, " \
+                                                                      + Entity.STATUS + " INTEGER NOT NULL " \
+                                                                      ")"
+        DBRequests.connect_to_db(command)
 
     @staticmethod
-    def find_entities(cur, user_id, with_updating=False):
-        if with_updating:
-            cur.execute(
-                'SELECT filepath, created, modified, accessed, filesize FROM ' + Entity.table_name + ' WHERE userid=?',
-                (user_id,))
-        else:
-            cur.execute('SELECT filepath, created, modified, accessed, filesize FROM ' + Entity.table_name +
-                        ' WHERE userid=? AND status<>?', (user_id, STATUS_UPDATING))
-        return cur.fetchall()
+    def add(user_id, filepath, filesize, created, modified, accessed):
+        status = STATUS_UPDATING if filesize else STATUS_SAVED
+        command = "INSERT INTO " + Entity.table_name +\
+                  " (id, filepath, userid, created, modified, accessed, filesize, status) " \
+                  "VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)"
+
+        args = (filepath, user_id, created, modified, accessed, filesize, status)
+        return DBRequests.connect_to_db(command, args, DB_QUERY_TYPE_INSERT)
 
     @staticmethod
-    def find_entity_by_userid_filepath(cur, user_id, filepath, with_updating=False):
-        if with_updating:
-            cur.execute('SELECT id, status, filepath, created, modified, accessed, filesize'
-                        ' FROM ' + Entity.table_name +
-                        ' WHERE userid=? AND filepath=?', (user_id, filepath))
-        else:
-            cur.execute('SELECT id, status, filepath, created, modified, accessed, filesize'
-                        ' FROM ' + Entity.table_name +
-                        ' WHERE userid=? AND filepath=? AND status<>?', (user_id, filepath, STATUS_UPDATING))
-        return cur.fetchone()
+    def find_one(params={}, select_values=[]):
+        return DBRequests.find_one(Entity.table_name, params, select_values)
 
     @staticmethod
-    def find_entity_by_id(cur, entity_id):
-        cur.execute('SELECT * FROM ' + Entity.table_name +
-                    ' WHERE id=?', (entity_id, ))
-        return cur.fetchone()
+    def find_many(params={}, select_values=[]):
+        return DBRequests.find_many(Entity.table_name, params, select_values)
 
     @staticmethod
-    def find_entity(cur, entity_id, user_id, with_updating=False):
-        if with_updating:
-            cur.execute('SELECT id'
-                        ' FROM ' + Entity.table_name +
-                        ' WHERE userid=? AND id=?', (user_id, entity_id))
-        else:
-            cur.execute('SELECT id FROM ' + Entity.table_name +
-                        ' WHERE userid=? AND id=? AND status<>?', (user_id, entity_id, STATUS_UPDATING))
-
-        return cur.fetchone()
+    def update(change_to, find_by={}):
+        DBRequests.update(Entity.table_name, change_to, find_by)
 
     @staticmethod
-    def create_entity(conn, cur, user_id, filepath, filesize, created, modified, accessed):
-        if filesize == 0:
-            status = STATUS_SAVED
-        else:
-            status = STATUS_UPDATING
-
-        cur.execute("INSERT INTO " + Entity.table_name +
-                    " (id, filepath, userid, created, modified, accessed, filesize, status) "
-                    "VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)",
-                    (filepath, user_id, created, modified, accessed, filesize, status))
-        conn.commit()
-        return cur.lastrowid
+    def delete(params):
+        DBRequests.delete(Entity.table_name, params)
 
     @staticmethod
-    def update_entity(conn, cur, entity_id, params):
+    def drop_table():
+        DBRequests.drop_table(Entity.table_name)
 
-        params_list = []
-        params_str = ""
-        for item in params.keys():
-            params_list.append(params[item])
-            params_str += ', ' + item + '=?'
-
-        if params_str and params_list:
-            params_str = params_str[2:]
-            params_list.append(entity_id)
-            cur.execute("UPDATE " + Entity.table_name +
-                        " SET " + params_str +
-                        " WHERE id=?",
-                        params_list)
-            conn.commit()
-
-    @staticmethod
-    def update_entity_status(cur, entity_id, status):
-        cur.execute("UPDATE " + Entity.table_name +
-                    " SET status=? WHERE id=? ",
-                    (status, entity_id))
-
-    @staticmethod
-    def delete_entity(conn, cur, entity_id):
-        cur.execute("DELETE FROM " + Entity.table_name + " WHERE id=?", (entity_id,))
-        conn.commit()
-
-    @staticmethod
-    def update_entity_name(conn, cur, entity_id, filename):
-        cur.execute("UPDATE " + Entity.table_name + " SET filepath=? WHERE id=? ",
-                    (filename, entity_id))
-        conn.commit()
 
 class EntityComponent:
-    """
-    Statuses:
-    1: uploading
-    2: saved
-    3: old
-    4: deleted
-    """
-    # TODO change table, ports and ips from node table by node_id
     table_name = 'entity_component'
+
+    ID = 'id'
+    TOKEN = 'token'
+    ENTITY_ID = 'entity_id'
+    NODE_ID = 'node_id'
+    FILE_ORDER = 'file_order'
+    REPLICA_NUMB = 'replica_numb'
+    STATUS = 'status'
+    CHUNK_SIZE = 'chunk_size'
 
     def __init__(self):
         pass
 
     @staticmethod
-    def create_table(cur):
-        cur.execute("CREATE TABLE IF NOT EXISTS " + EntityComponent.table_name + " ("
-                    "id INTEGER PRIMARY KEY, "
-                    "token VARCHAR(64) NOT NULL, "
-                    "entity_id INTEGER NOT NULL, "
-                    "node_id INTEGER NOT NULL, "
-                    "file_order INTEGER NOT NULL, "
-                    "replica_numb INTEGER NOT NULL, "
-                    "status INTEGER DEFAULT 0, "
-                    "chunk_size INTEGER NOT NULL "
-                    ")")
-    @staticmethod
-    def find_entity_components(cur, entity_id, status=0):
-        # TODO what if some parts are not loaded
-        # TODO handle the situation when the file had to be deleted
-        # TODO convert ip address to str
+    def create_table():
+        command = "CREATE TABLE IF NOT EXISTS " + EntityComponent.table_name + \
+                  " (" \
+                   + EntityComponent.ID + " INTEGER PRIMARY KEY, " \
+                   + EntityComponent.TOKEN + " VARCHAR(64) NOT NULL, " \
+                   + EntityComponent.ENTITY_ID + " INTEGER NOT NULL, " \
+                   + EntityComponent.NODE_ID + " INTEGER NOT NULL, " \
+                   + EntityComponent.FILE_ORDER + " INTEGER NOT NULL, " \
+                   + EntityComponent.REPLICA_NUMB + " INTEGER NOT NULL, " \
+                   + EntityComponent.STATUS + " INTEGER DEFAULT 0, " \
+                   + EntityComponent.CHUNK_SIZE + " INTEGER NOT NULL " \
+                  ")"
 
-        if status != 0:
-            cur.execute(
-                'SELECT * FROM ' + EntityComponent.table_name +
-                ' WHERE entity_id=? AND status=? AND status<>4',
-                (entity_id, status))
-        else:
-            cur.execute(
-                'SELECT * FROM ' + EntityComponent.table_name +
-                ' WHERE entity_id=? AND status<>4',
-                (entity_id,))
-        return cur.fetchall()
+        DBRequests.connect_to_db(command)
+
 
     @staticmethod
-    def find_entity_components(cur, entity_id, status=0):
-        # TODO what if some parts are not loaded
-        # TODO handle the situation when the file had to be deleted
-        # TODO convert ip address to str
-
-        if status != 0:
-            cur.execute(
-                'SELECT * FROM ' + EntityComponent.table_name +
-                ' WHERE entity_id=? AND status=? AND status<>4',
-                (entity_id, status))
-        else:
-            cur.execute(
-                'SELECT * FROM ' + EntityComponent.table_name +
-                ' WHERE entity_id=? AND status<>4',
-                (entity_id,))
-        return cur.fetchall()
-
-    @staticmethod
-    def find_entity_component(cur, token):
-        cur.execute(
-            'SELECT * FROM ' + EntityComponent.table_name +
-            ' WHERE token=? AND status<>4',
-            (token,))
-        return cur.fetchone()
-
-    @staticmethod
-    def add_entity_component(conn, cur, entity_id, node_id, file_order, replica_numb, status, chunk_size):
+    def add(entity_id, node_id, file_order, replica_numb, status, chunk_size):
         token = binascii.b2a_hex(os.urandom(32))
-        cur.execute('INSERT INTO ' + EntityComponent.table_name + ' (id, token, entity_id, node_id, file_order, '
-                                                                  'replica_numb, status, chunk_size) '
-                                                                  'VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)',
-                    (token, entity_id, node_id, file_order, replica_numb, status, chunk_size))
-        conn.commit()
-
+        command = 'INSERT INTO ' + EntityComponent.table_name + ' (id, token, entity_id, node_id, file_order, ' \
+                                                                'replica_numb, status, chunk_size) ' \
+                                                                'VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)'
+        args = (token, entity_id, node_id, file_order, replica_numb, status, chunk_size)
+        DBRequests.connect_to_db(command, args, DB_QUERY_TYPE_INSERT)
         return token
 
     @staticmethod
-    def drop_table(cur):
-        cur.execute("DROP TABLE " + EntityComponent.table_name)
+    def find_many(params, select_values=[], additional_command=""):
+        return DBRequests.find_many(EntityComponent.table_name, params, select_values, additional_command)
 
     @staticmethod
-    def update_component_status(conn, cur, status, component_id):
-        cur.execute("UPDATE " + EntityComponent.table_name + " SET status=? WHERE id=?", (status, component_id))
-        conn.commit()
+    def find_one(params, select_values=[], additional_command=""):
+        return DBRequests.find_one(EntityComponent.table_name, params, select_values, additional_command)
 
     @staticmethod
-    def update_components_status(conn, cur, status, entity_id):
-        param_str = 'status=?'
-        param_list = [status]
-
-        if status == STATUS_DELETED:
-            param_list.append(0)
-            param_str += ', entity_id=?'
-
-        param_list.append(entity_id)
-
-        cur.execute("UPDATE " + EntityComponent.table_name + " SET " + param_str + " WHERE entity_id=? AND status<>4",
-                    param_list)
-
-        conn.commit()
+    def drop_table():
+        DBRequests.drop_table(EntityComponent.table_name)
 
     @staticmethod
-    def delete_component(conn, cur, component_id):
-        cur.execute("DELETE FROM " + EntityComponent.table_name + " WHERE id=?", (component_id,))
-        conn.commit()
+    def update(change_to, find_by={}):
+        DBRequests.update(EntityComponent.table_name, change_to, find_by)
 
     @staticmethod
-    def delete_old_components_by_entity_id(conn, cur, entity_id):
-        cur.execute("DELETE FROM " + EntityComponent.table_name + " WHERE entity_id=? and status=3", (entity_id,))
-        conn.commit()
+    def delete(params):
+        DBRequests.delete(EntityComponent.table_name, params)
+
 
 class Node:
     table_name = 'node'
 
+    ID = 'id'
+    TOKEN = 'token'
+    PORT = 'port'
+    IP = 'ip'
+    TOTAL_MEMORY = 'total_memory'
+    FREE_MEMORY = 'free_memory'
+    ALIVE = 'alive'
+    NODE_TYPE = 'node_type'
+
     def __init__(self):
         pass
 
     @staticmethod
-    def create_table(cur):
-        cur.execute("CREATE TABLE IF NOT EXISTS " + Node.table_name + " ("
-                    "id INTEGER PRIMARY KEY, "
-                    "token VARCHAR(128), "
-                    "port INTEGER NOT NULL, "
-                    "ip VARCHAR(15) NOT NULL, "
-                    "total_memory REAL, "
-                    "free_memory REAL, "
-                    "alive INTEGER DEFAULT 0 "
-                    ")")
-    @staticmethod
-    def add_node(conn, cur, token, ip, port):
-        # TODO check for successful execution
-        cur.execute("INSERT INTO " + Node.table_name + "(id, token, port, ip) VALUES (NULL, ?, ?, ?)",
-                    (token, port, ip))
-        conn.commit()
+    def create_table():
+        command = "CREATE TABLE IF NOT EXISTS " + Node.table_name + " (" \
+                                                                    + Node.ID + " INTEGER PRIMARY KEY, " \
+                                                                    + Node.TOKEN + " VARCHAR(128) NOT NULL, " \
+                                                                    + Node.PORT + " INTEGER NOT NULL, " \
+                                                                    + Node.IP + " VARCHAR(15) NOT NULL, " \
+                                                                    + Node.TOTAL_MEMORY + " REAL, " \
+                                                                    + Node.FREE_MEMORY + " REAL, " \
+                                                                    + Node.ALIVE + " INTEGER DEFAULT 0, " \
+                                                                    + Node.NODE_TYPE + " INTEGER NOT NULL " \
+                                                                    ")"
+        DBRequests.connect_to_db(command)
 
     @staticmethod
-    def find_by_token(cur, token):
-        cur.execute("SELECT * FROM " + Node.table_name + " WHERE token=?", (token,))
-        return cur.fetchone()
+    def add(token, ip, port, node_type):
+        command = "INSERT INTO " + Node.table_name + "(id, token, port, ip, node_type) " \
+                                                     "VALUES (NULL, ?, ?, ?, ?)"
+        args = (token, port, ip, node_type)
+        DBRequests.connect_to_db(command, args, DB_QUERY_TYPE_INSERT)
 
     @staticmethod
-    def find_by_id(cur, node_id):
-        cur.execute("SELECT * FROM " + Node.table_name + " WHERE id=?", (node_id,))
-        return cur.fetchone()
+    def find_one(params={}, select_values=[]):
+        return DBRequests.find_one(Node.table_name, params, select_values)
 
     @staticmethod
-    def find_nodes(cur):
-        cur.execute("SELECT * FROM " + Node.table_name)
-        return cur.fetchall()
+    def find_many(params={}, select_values=[]):
+        return DBRequests.find_many(Node.table_name, params, select_values)
 
     @staticmethod
-    def update_node(conn, cur, token, params):
-        params_list = []
-        params_str = ""
-        for item in params.keys():
-            params_list.append(params[item])
-            params_str += ', ' + item + '=?'
-
-        if params_str and params_list:
-            params_str = params_str[2:]
-            params_list.append(token)
-            cur.execute("UPDATE " + Node.table_name +
-                        " SET " + params_str +
-                        " WHERE token=?",
-                        params_list)
-            conn.commit()
+    def update(change_to, find_by={}):
+        DBRequests.update(Node.table_name, change_to, find_by)
 
     @staticmethod
-    def drop_table(cur):
-        cur.execute("DROP TABLE " + Node.table_name)
+    def drop_table():
+        DBRequests.drop_table(Node.table_name)
 
     @staticmethod
-    def delete_node(conn, cur, node_id):
-        cur.execute("DELETE FROM " + Node.table_name + " WHERE id=?", (node_id,))
-        conn.commit()
+    def delete(params):
+        DBRequests.delete(Node.table_name, params)
 
     @staticmethod
     def check_node(sock, authorized_nodes):
         if sock not in authorized_nodes:
             print sock, 'node', ERROR_TEXT[PERMISSION_DENIED]
-            send_error(sock, PERMISSION_DENIED)
             return False
 
         return True
 
-def parse_package(package):
-    pass
+
+class DBRequests:
+
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def dict_factory(cur, row):
+        d = {}
+        for idx, col in enumerate(cur.description):
+            d[col[0]] = row[idx]
+        return d
+
+    @staticmethod
+    def init_db():
+        User.create_table()
+        Entity.create_table()
+        EntityComponent.create_table()
+        Node.create_table()
+
+    @staticmethod
+    def connect_to_db(command, args=(), command_type=DB_QUERY_TYPE_OTHER):
+        conn = sqlite3.connect("db/namingserver.db")
+        conn.row_factory = DBRequests.dict_factory
+        cur = conn.cursor()
+
+        cur.execute(command, args)
+
+        result = None
+        if command_type is DB_QUERY_TYPE_INSERT:
+            conn.commit()
+            result = cur.lastrowid
+        elif command_type is DB_QUERY_TYPE_SELECT_ONE:
+            result = cur.fetchone()
+        elif command_type is DB_QUERY_TYPE_SELECT_ALL:
+            result = cur.fetchall()
+        elif command_type is DB_QUERY_TYPE_OTHER:
+            conn.commit()
+        else:
+            raise Exception('DB connection, wrong command type')
+
+        conn.close()
+
+        return result
+
+    @staticmethod
+    def find_command(table_name, params={}, select_values=[]):
+        command, args = DBRequests.params_list(params, "AND ", "? ", " WHERE")
+
+        if select_values:
+            select_str = ""
+            for value in select_values:
+                select_str += ", " + value
+            select_str = select_str[1:]
+        else:
+            select_str = " *"
+
+        command = "SELECT" + select_str + " FROM " + table_name + command
+        return command, args
+
+    @staticmethod
+    def find_one(table_name, params={}, select_values=[], additional_command=""):
+        command, args = DBRequests.find_command(table_name, params, select_values)
+
+        return DBRequests.connect_to_db(command + additional_command, args, DB_QUERY_TYPE_SELECT_ONE)
+
+    @staticmethod
+    def find_many(table_name, params={}, select_values=[], additional_command=""):
+        command, args = DBRequests.find_command(table_name, params, select_values)
+
+        return DBRequests.connect_to_db(command + additional_command, args, DB_QUERY_TYPE_SELECT_ALL)
+
+    @staticmethod
+    def update(table_name, change_to, find_by={}):
+        set_command, set_args = DBRequests.params_list(change_to, ", ", "? ", " SET")
+        where_command, where_args = DBRequests.params_list(find_by, "AND ", "? ", " WHERE")
+
+        DBRequests.connect_to_db("UPDATE " + table_name + set_command + where_command, set_args + where_args)
+
+    @staticmethod
+    def drop_table(table_name):
+        DBRequests.connect_to_db("DROP TABLE " + table_name)
+
+    @staticmethod
+    def delete(table_name, params):
+        delete_command, delete_args = DBRequests.params_list(params, "AND ", "? ", " WHERE")
+        DBRequests.connect_to_db("DELETE FROM " + table_name + delete_command, delete_args)
+
+    @staticmethod
+    def params_list(params, separator_start, separator_end, start_command):
+        command = ""
+        args = []
+
+        if params:
+            for key in params.keys():
+                if type(params[key]) is dict:
+                    for operator in params[key]:
+                        value = params[key][operator]
+                        command += separator_start + key + operator + separator_end
+                        args.append(str(value))
+                else:
+                    command += separator_start + key + "=" + separator_end
+                    args.append(str(params[key]))
+
+            command = start_command + command[len(separator_start) - 1:]
+
+        return command, args
 
 
 def main():
-    init_db()
+    DBRequests.init_db()
 
-    global storage_update_thread
-    storage_update_thread = StorageUpdate()
-    storage_update_thread.start()
-
-    serv = NameServer('', PORT)
+    serv = NamingServer('', PORT)
     serv.start()
 
 
