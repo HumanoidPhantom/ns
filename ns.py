@@ -12,7 +12,6 @@ import json
 import math
 import time
 import string
-import re
 import logging
 
 """
@@ -131,7 +130,7 @@ CLIENT_NODE_FAILED_REQUEST = 38
 STORAGE_CREATE_REPLICA_REQUEST = 39
 STORAGE_CREATE_REPLICA_RESPONSE = 40
 
-MEMORY_REQUEST_TIMEOUT = 20
+MEMORY_REQUEST_TIMEOUT = 40
 CLIENT_TIMEOUT = 60
 
 RESPONSE_OK = 1
@@ -184,7 +183,7 @@ def send(sock, package_id, data):
     try:
         sock.send(header + data)
     except:
-        print_logs('Error while message sending', DEBUG_MODE)
+        print_logs((sock, 'Error while message sending'), DEBUG_MODE)
         return False
 
     return True
@@ -606,7 +605,7 @@ class StorageUpdate(threading.Thread):
                 if sock in self.repl_counter.keys() or self.repl_counter[sock] != 0:
                     self.repl_counter[sock] -= 1
 
-            self.close_connection(sock, False, clear_replica=False)
+            self.close_connection(sock, False, True, False, False)
 
     def connect_to_nodes(self):
         nodes = Node.find_many()
@@ -914,7 +913,6 @@ class NamingServer(threading.Thread):
         """
         # TODO public/private key use
         node, token = self.check_by_token(sock, Node.table_name)
-        print_logs(('handshake', sock), DEBUG_MODE)
         if token is False:
             return
 
@@ -934,6 +932,7 @@ class NamingServer(threading.Thread):
             print_logs((msg, sock), DEBUG_MODE)
             self.send_handshake_response(sock, token, RESPONSE_FAILURE)
             return
+        print_logs(('handshake', sock, port, ip), DEBUG_MODE)
 
         if not node:
             nodes = Node.find_many()
@@ -1199,10 +1198,11 @@ class NamingServer(threading.Thread):
                 'total': total,
                 'data': []
             }
+        print_logs((user, token, 'node failed', sock, data, total, number, datasize), DEBUG_MODE)
 
-        self.failed_node_info[sock]['data'][number] = data
+        self.failed_node_info[sock]['data'].append(data)
 
-        if len(self.failed_node_info['data']) == total:
+        if len(self.failed_node_info[sock]['data']) == total:
             self.file_partitioning_update(sock, user)
 
     def file_save_result_request(self, sock):
@@ -1644,7 +1644,7 @@ class NamingServer(threading.Thread):
                     entity_id, nodes[ind][Node.ID], i,
                     NODE_TYPE_MAIN, STATUS_UPDATING, chunk_sizes[ind]
                 )
-
+                metadata['continue'] = continue_load
                 metadata['components'].append({
                     'filename': filename,
                     'filesize': chunk_sizes[ind],
@@ -1652,12 +1652,11 @@ class NamingServer(threading.Thread):
                     'port': nodes[ind][Node.PORT],
                     'file_order': i,
                     'replica': NODE_TYPE_MAIN,
-                    'continue': continue_load,
                     'offset': offset
                 })
                 offset += chunk_sizes[ind]
                 i += 1
-
+        print metadata, 'result'
         json_tree = json.dumps(metadata)
         self.pack_and_send_data(sock, CLIENT_SEND_UPLOAD_RESULT, json_tree)
 
@@ -1668,7 +1667,7 @@ class NamingServer(threading.Thread):
         info = self.failed_node_info[sock]
 
         data = ""
-        for item in sorted(info['data'].items()):
+        for item in sorted(info['data']):
             data += item
 
         try:
@@ -1690,7 +1689,6 @@ class NamingServer(threading.Thread):
             print_logs((sock, 'entity not found', file_data['filepath']), DEBUG_MODE)
             return
 
-        # TODO how nodes are sent - field name
         Node.update_field({Node.ALIVE: 0}, {
             Node.IP: file_data['node']['ip'], Node.PORT: file_data['node']['port'], Node.NODE_TYPE: NODE_TYPE_MAIN
         })
@@ -1704,7 +1702,7 @@ class NamingServer(threading.Thread):
 
         uploaded_ids = [item[EntityComponent.NODE_ID] for item in uploaded_components]
         free_memory = [node[Node.FREE_MEMORY] for node in nodes
-                       if nodes[EntityComponent.ID] not in uploaded_ids]
+                       if node[EntityComponent.ID] not in uploaded_ids]
 
         not_loaded_components = EntityComponent.find_many({
             EntityComponent.ENTITY_ID: entity[Entity.ID],
@@ -1715,38 +1713,53 @@ class NamingServer(threading.Thread):
         chunk_sizes = self.separate_on_chunks(free_memory, not_loaded_size)
 
         continue_load = 1
+        print free_memory, chunk_sizes, 'try continue'
         if not chunk_sizes:
             for comp in uploaded_components:
                 EntityComponent.update_field({EntityComponent.STATUS: STATUS_DELETED}, {EntityComponent.ID: comp[EntityComponent.ID]})
                 not_loaded_size += comp[EntityComponent.CHUNK_SIZE]
 
-            free_memory = {node[Node.ID]: node[Node.FREE_MEMORY] for node in nodes}
+            free_memory = [node[Node.FREE_MEMORY] for node in nodes]
             chunk_sizes = self.separate_on_chunks(free_memory, not_loaded_size)
+            print free_memory, chunk_sizes, 'try upload all'
             continue_load = 0
             if not chunk_sizes:
-                # TODO possible collision, if file pointed as deleted, but actually - not yet
                 User.update_field({User.MEMORY: user[User.MEMORY] + entity[Entity.FILESIZE]}, {User.ID: user[User.ID]})
 
-                EntityComponent.update_field(
-                    {EntityComponent.STATUS: STATUS_SAVED},
-                    {EntityComponent.STATUS: STATUS_OLD, EntityComponent.ENTITY_ID: entity[Entity.ID]}
-                )
+                old = EntityComponent.find_one({EntityComponent.STATUS: STATUS_OLD, EntityComponent.ENTITY_ID: entity[Entity.ID]})
 
-                entity_data = {
-                    Entity.MODIFIED_NEW: None,
-                    Entity.STATUS: STATUS_SAVED,
-                    Entity.FILESIZE_NEW: None
-                }
+                if old:
+                    EntityComponent.update_field(
+                        {EntityComponent.STATUS: STATUS_DELETED},
+                        {EntityComponent.STATUS: {'<>': STATUS_OLD}, EntityComponent.ENTITY_ID: entity[Entity.ID]}
+                    )
 
-                Entity.update_field(
-                    entity_data,
-                    {Entity.ID: entity[Entity.ID]}
-                )
+                    EntityComponent.update_field(
+                        {EntityComponent.STATUS: STATUS_SAVED},
+                        {EntityComponent.STATUS: STATUS_OLD, EntityComponent.ENTITY_ID: entity[Entity.ID]}
+                    )
+
+                    entity_data = {
+                        Entity.MODIFIED_NEW: None,
+                        Entity.STATUS: STATUS_SAVED,
+                        Entity.FILESIZE_NEW: None
+                    }
+
+                    Entity.update_field(
+                        entity_data,
+                        {Entity.ID: entity[Entity.ID]}
+                    )
+                else:
+                    EntityComponent.update_field(
+                        {EntityComponent.STATUS: STATUS_DELETED},
+                        {EntityComponent.ENTITY_ID: entity[Entity.ID]}
+                    )
+
+                    Entity.delete({Entity.ID: entity[Entity.ID]})
 
                 send_error(sock, NOT_ENOUGH_PLACE)
                 print_logs('node failed, no place available', DEBUG_MODE)
                 return
-
         self.update_file(sock, entity[Entity.ID], {'filesize': entity[Entity.FILESIZE]}, chunk_sizes, nodes, continue_load)
 
 
