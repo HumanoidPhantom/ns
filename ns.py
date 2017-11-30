@@ -130,7 +130,7 @@ CLIENT_NODE_FAILED_REQUEST = 38
 STORAGE_CREATE_REPLICA_REQUEST = 39
 STORAGE_CREATE_REPLICA_RESPONSE = 40
 
-MEMORY_REQUEST_TIMEOUT = 40
+MEMORY_REQUEST_TIMEOUT = 35
 CLIENT_TIMEOUT = 60
 
 RESPONSE_OK = 1
@@ -178,7 +178,6 @@ def error_received(sock):
 
 
 def send(sock, package_id, data):
-    # TODO check if user still connected
     header = struct.pack('<hB', 666, package_id)
     try:
         sock.send(header + data)
@@ -464,6 +463,7 @@ class StorageUpdate(threading.Thread):
             self.timer = threading.Event()
             self.connect_to_nodes()
 
+            time.sleep(5)
             for sock in self.connections:
                 start, package_id = read_header(sock, 'StorageUpdate')
 
@@ -642,8 +642,7 @@ class StorageUpdate(threading.Thread):
                 })
 
                 for component in entity_components:
-                    data = node[Node.TOKEN].encode() + component[EntityComponent.TOKEN].encode() + \
-                           ipaddress.IPv4Address(node[Node.IP].decode()).packed + struct.pack('<H', node[Node.PORT])
+                    data = node[Node.TOKEN].encode() + component[EntityComponent.TOKEN].encode()
                     self.send_request(out_sock, node, STORAGE_SEND_DELETE_REQUEST, data)
                     if out_sock not in self.repl_counter.keys():
                         self.repl_counter[out_sock] = 1
@@ -994,7 +993,6 @@ class NamingServer(threading.Thread):
         """
         19 | token[128] size[2] srcfilepath size[2] dstfilepath | client to ns - rename file request
         """
-        # TODO update dir name
         user, token = self.check_by_token(sock, User.table_name)
 
         if user is False:
@@ -1820,7 +1818,6 @@ class User:
 
     @staticmethod
     def check_token_time(user):
-        # TODO
         return time.time() - user['last_login_time'] < CLIENT_TIMEOUT
 
 
